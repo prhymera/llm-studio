@@ -1,14 +1,24 @@
 # ─────────────────────────────────────────────────────────────
-# LLM Studio — Hedgefund docker-compose integration fragment
+# LLM Studio — Standalone Docker Compose
+# Can run independently OR be merged into the hedgefund portal's
+# docker-compose.yml (see INTEGRATION.md for details).
+# ─────────────────────────────────────────────────────────────
+
+# ── Configuration ───────────────────────────────────────────
+# All environment variables have safe defaults. Copy this file
+# to .env and customize for your deployment:
 #
-# Add this entire block to ~/prhyme/projects/hedgefund/docker-compose.yml
-# Or use: docker compose -f docker-compose.yml -f docker-compose.llm-studio.yml up
-#
-# See INTEGRATION.md for detailed integration instructions.
+#   BIND_IP=127.0.0.1           # Listen address
+#   LLAMA_MODELS_DIR=/models     # Path to GGUF model files
+#   JWT_SECRET=change-me         # Secret for JWT validation
+#   DEEPSEEK_API_KEY=sk-...      # Remote API keys
+#   WEBUI_SECRET_KEY=change-me   # Open WebUI encryption key
 # ─────────────────────────────────────────────────────────────
 
 services:
-  # ── llm-gateway: Local LLM Model Lifecycle Manager ──
+  # ── llm-gateway: Model Lifecycle Manager ──
+  # Manages llama.cpp server processes and exposes an
+  # OpenAI-compatible API for both local and remote models.
   llm-gateway:
     build:
       context: ./code/llm-gateway
@@ -24,20 +34,30 @@ services:
       DEFAULT_MODEL: "${DEFAULT_MODEL:-}"
       MODEL_CONTEXT_SIZE: "${MODEL_CONTEXT_SIZE:-8192}"
       MODEL_THREADS: "${MODEL_THREADS:-4}"
-      # Remote provider API keys (reuse existing Dexter env vars)
-      DEEPSEEK_API_KEY: "${DEXTER_DEEPSEEK_API_KEY:-}"
-      GEMINI_API_KEY: "${DEXTER_GOOGLE_API_KEY:-}"
-      OPENAI_API_KEY: "${DEXTER_OPENAI_API_KEY:-}"
-      ANTHROPIC_API_KEY: "${DEXTER_ANTHROPIC_API_KEY:-}"
-      OPENROUTER_API_KEY: "${DEXTER_OPENROUTER_API_KEY:-}"
-      XAI_API_KEY: "${DEXTER_XAI_API_KEY:-}"
+      # Remote provider API keys (pass through from .env)
+      DEEPSEEK_API_KEY: "${DEEPSEEK_API_KEY:-}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      OPENROUTER_API_KEY: "${OPENROUTER_API_KEY:-}"
+      XAI_API_KEY: "${XAI_API_KEY:-}"
+      # Passthrough from hedgefund env naming convention
+      DEXTER_DEEPSEEK_API_KEY: "${DEXTER_DEEPSEEK_API_KEY:-}"
+      DEXTER_GOOGLE_API_KEY: "${DEXTER_GOOGLE_API_KEY:-}"
+      DEXTER_OPENAI_API_KEY: "${DEXTER_OPENAI_API_KEY:-}"
+      DEXTER_ANTHROPIC_API_KEY: "${DEXTER_ANTHROPIC_API_KEY:-}"
+      DEXTER_OPENROUTER_API_KEY: "${DEXTER_OPENROUTER_API_KEY:-}"
+      DEXTER_XAI_API_KEY: "${DEXTER_XAI_API_KEY:-}"
     volumes:
+      # GGUF model files (read-only, bind mount from host)
       - "${LLAMA_MODELS_DIR:-~/.local/share/llama-lab/models}:/models:ro"
+      # Persistent data for generated configs and logs
       - llm-studio-config:/data/config
       - llm-studio-logs:/data/logs
+      # llama.cpp binary (host must have it installed or mount from container)
       - "${LLAMACPP_BIN_DIR:-/usr/local/bin}:/usr/local/bin:ro"
     networks:
-      - trading-network
+      - llm-studio-network
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "wget", "-qO-", "http://localhost:3100/health"]
@@ -47,6 +67,8 @@ services:
       start_period: 10s
 
   # ── agent-runner: Ephemeral Agent Container Manager ──
+  # Launches picoclaw, pi.dev, opencode in Docker containers
+  # with persistent workspace volumes.
   agent-runner:
     build:
       context: ./code/agent-runner
@@ -63,13 +85,17 @@ services:
       AGENT_CPU_LIMIT: "${AGENT_CPU_LIMIT:-4}"
       AGENT_MEMORY_LIMIT: "${AGENT_MEMORY_LIMIT:-4G}"
     volumes:
+      # Docker socket for spawning agent containers
       - /var/run/docker.sock:/var/run/docker.sock:rw
+      # Persistent workspace and session data
       - llm-studio-workspaces:/data/workspaces
       - llm-studio-sessions:/data/sessions
+      # Read-only config from llm-gateway
       - llm-studio-config:/data/config:ro
+      # Logs
       - llm-studio-logs:/data/logs
     networks:
-      - trading-network
+      - llm-studio-network
     restart: unless-stopped
     depends_on:
       llm-gateway:
@@ -81,7 +107,9 @@ services:
       retries: 3
       start_period: 10s
 
-  # ── auth-bridge: SSO Proxy for Open WebUI (optional) ──
+  # ── auth-bridge: SSO Proxy for Open WebUI ──
+  # Validates portal JWT, injects auth headers,
+  # auto-provisions users in Open WebUI.
   auth-bridge:
     build:
       context: ./code/auth-bridge
@@ -94,42 +122,41 @@ services:
       OPEN_WEBUI_URL: "http://open-webui:8080"
       OPEN_WEBUI_ADMIN_KEY: "${WEBUI_ADMIN_KEY:-}"
     networks:
-      - trading-network
+      - llm-studio-network
     restart: unless-stopped
     depends_on:
       open-webui:
         condition: service_started
 
   # ── open-webui: LLM Studio Chat Frontend ──
+  # Feature-rich chat interface with RAG, prompt libraries,
+  # multi-modal support, and more.
   open-webui:
     image: ghcr.io/open-webui/open-webui:main
-    # In orchestrated mode, use expose (not ports) — access via nginx
-    expose:
-      - "8080"
+    ports:
+      - "${BIND_IP:-0.0.0.0}:3000:8080"
     environment:
+      # Point to our gateway for local + remote model access
       - OPENAI_API_BASE_URL=http://llm-gateway:3100/v1
+      # Auth: trust headers from auth-bridge
       - WEBUI_AUTH_TRUST_HEADERS=true
       - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:-change-me-in-production}
-      - WEBUI_NAME=${WEBUI_NAME:-Frao LLM Studio}
+      - WEBUI_NAME=${WEBUI_NAME:-LLM Studio}
       - WEBUI_DEFAULT_MODEL=${DEFAULT_MODEL:-qwen25-coder-7b}
+      - WEBUI_DEFAULT_PROMPT_TEMPLATES=${WEBUI_DEFAULT_PROMPT_TEMPLATES:-}
     volumes:
       - open-webui-data:/app/backend/data
     networks:
-      - trading-network
+      - llm-studio-network
     restart: unless-stopped
     depends_on:
       llm-gateway:
         condition: service_healthy
 
-# ── Volumes ─────────────────────────────────────────────────
-# Add these to the existing volumes: section.
-# For production, use host bind mounts:
-#   llm-studio-config:
-#     driver: local
-#     driver_opts:
-#       type: none
-#       device: /data/llm-studio/config
-#       o: bind
+networks:
+  llm-studio-network:
+    driver: bridge
+
 volumes:
   llm-studio-config:
   llm-studio-workspaces:

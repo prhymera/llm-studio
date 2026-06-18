@@ -9,25 +9,25 @@ WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 
-# Build with full source (including internal packages)
+# Build
 COPY . .
 RUN CGO_ENABLED=0 GOOS=linux go build \
-    -ldflags="-s -w -X main.version=0.1.0" \
-    -o /llm-gateway ./cmd/
+    -ldflags="-s -w" \
+    -o /agent-runner ./cmd/
 
 # ── Runtime Stage ──
 FROM alpine:3.19
 
-RUN apk add --no-cache ca-certificates tzdata
+RUN apk add --no-cache ca-certificates tzdata docker-cli
 
 # Create required directories
-RUN mkdir -p /data/config /data/logs /models
+RUN mkdir -p /data/sessions /data/workspaces /data/logs
 
-COPY --from=builder /llm-gateway /usr/local/bin/llm-gateway
+COPY --from=builder /agent-runner /usr/local/bin/agent-runner
 
-EXPOSE 3100
+EXPOSE 3200
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=5s --retries=3 \
-    CMD wget -qO- http://localhost:3100/health || exit 1
+    CMD wget -qO- http://localhost:3200/health || exit 1
 
-ENTRYPOINT ["llm-gateway"]
+ENTRYPOINT ["agent-runner"]
