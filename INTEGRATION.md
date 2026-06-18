@@ -331,7 +331,7 @@ The `/agents` route is a native SvelteKit page with xterm.js.
 | `MODEL_CONTEXT_SIZE` | `8192` | Context window for local models |
 | `BIND_IP` | `0.0.0.0` | IP to bind services to (set to `127.0.0.1` for security) |
 | `LLAMA_MODELS_DIR` | `~/.local/share/llama-lab/models` | Path to GGUF model files on host |
-| `LLAMACPP_BIN_DIR` | `/usr/local/bin` | Directory containing `llama-server` binary on host |
+| `LLAMA_SERVER_PATH` | `/usr/local/bin/llama-server` | Path to `llama-server` binary on host (mount specific file to avoid shadowing) |
 
 ### 6.3 API Key Variables
 

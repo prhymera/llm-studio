@@ -54,8 +54,8 @@ services:
       # Persistent data for generated configs and logs
       - llm-studio-config:/data/config
       - llm-studio-logs:/data/logs
-      # llama.cpp binary (host must have it installed or mount from container)
-      - "${LLAMACPP_BIN_DIR:-/usr/local/bin}:/usr/local/bin:ro"
+      # llama-server binary — mount specific file, not whole dir (prevents shadowing)
+      - "${LLAMA_SERVER_PATH:-/usr/local/bin/llama-server}:/usr/local/bin/llama-server:ro"
     networks:
       - llm-studio-network
     restart: unless-stopped
@@ -134,7 +134,8 @@ services:
   open-webui:
     image: ghcr.io/open-webui/open-webui:main
     ports:
-      - "${BIND_IP:-0.0.0.0}:3000:8080"
+      # Port 3000 may be taken by other services (aetherflow-svc), so use 3001
+      - "${BIND_IP:-0.0.0.0}:${WEBUI_PORT:-3001}:8080"
     environment:
       # Point to our gateway for local + remote model access
       - OPENAI_API_BASE_URL=http://llm-gateway:3100/v1

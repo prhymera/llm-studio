@@ -35,7 +35,8 @@ services:
       - "${LLAMA_MODELS_DIR:-~/.local/share/llama-lab/models}:/models:ro"
       - llm-studio-config:/data/config
       - llm-studio-logs:/data/logs
-      - "${LLAMACPP_BIN_DIR:-/usr/local/bin}:/usr/local/bin:ro"
+      # Mount specific llama-server binary, not whole dir (prevents shadowing container binaries)
+      - "${LLAMA_SERVER_PATH:-/usr/local/bin/llama-server}:/usr/local/bin/llama-server:ro"
     networks:
       - trading-network
     restart: unless-stopped
