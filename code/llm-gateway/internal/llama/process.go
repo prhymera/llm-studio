@@ -4,14 +4,15 @@
 package llama
 
 import (
-	"bufio"
 	"context"
 	"fmt"
 	"io"
 	"log"
+	"net/http"
 	"os/exec"
 	"sync"
 	"syscall"
+	"time"
 )
 
 // State represents the llama.cpp server process state.
@@ -112,8 +113,12 @@ func (p *Process) Start(ctx context.Context) error {
 	args := p.buildArgs()
 	log.Printf("Starting llama-server: %s %v", p.config.BinaryPath, args)
 
-	cmd := exec.CommandContext(ctx, p.config.BinaryPath, args...)
+	// Use exec.Command (not CommandContext) so the process outlives the startup context.
+	// CommandContext kills the subprocess when the context is cancelled, which would
+	// kill llama-server once the load handler returns and its defer cancel() runs.
+	cmd := exec.Command(p.config.BinaryPath, args...)
 
+	// Create pipes for output (redirect to dev null for scanner — we poll HTTP instead)
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		p.setState(StateFailed)
@@ -137,10 +142,16 @@ func (p *Process) Start(ctx context.Context) error {
 		return fmt.Errorf("start: %w", err)
 	}
 
-	// Monitor stdout for "ready" signal
-	readyCh := make(chan error, 1)
-	go p.waitForReady(stdout, readyCh)
+	// Drain stdout/stderr in background to prevent pipe deadlock
+	go io.Copy(io.Discard, stdout)
+	go io.Copy(io.Discard, stderr)
 
+	// Poll the llama-server HTTP endpoint until it responds or context is cancelled
+	readyCh := make(chan error, 1)
+	go p.pollForReady(ctx, readyCh)
+
+	// Wait for ready or timeout
+	timeout := 180 * time.Second
 	select {
 	case err := <-readyCh:
 		if err != nil {
@@ -153,12 +164,49 @@ func (p *Process) Start(ctx context.Context) error {
 		// Monitor process in background
 		go p.monitorProcess()
 
+	case <-time.After(timeout):
+		log.Printf("llama-server did not become ready within %v", timeout)
+		p.stop()
+		return fmt.Errorf("start timed out after %v", timeout)
+
 	case <-ctx.Done():
+		log.Printf("llama-server startup cancelled")
 		p.stop()
 		return fmt.Errorf("start cancelled: %w", ctx.Err())
 	}
 
 	return nil
+}
+
+// pollForReady polls the llama-server health endpoint until it responds.
+func (p *Process) pollForReady(ctx context.Context, readyCh chan<- error) {
+	client := &http.Client{Timeout: 2 * time.Second}
+	serverURL := fmt.Sprintf("http://%s:%d/health", p.config.Host, p.config.Port)
+
+	for i := 0; i < 180; i++ { // up to 180 * 1s = 180s
+		select {
+		case <-p.stopCh:
+			readyCh <- fmt.Errorf("process was stopped")
+			return
+		case <-ctx.Done():
+			readyCh <- fmt.Errorf("context cancelled")
+			return
+		default:
+		}
+
+		resp, err := client.Get(serverURL)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == http.StatusOK {
+				readyCh <- nil
+				return
+			}
+		}
+
+		time.Sleep(1 * time.Second)
+	}
+
+	readyCh <- fmt.Errorf("server did not respond within timeout")
 }
 
 // Stop terminates the llama.cpp server gracefully.
@@ -176,6 +224,7 @@ func (p *Process) Stop() error {
 func (p *Process) stop() error {
 	if p.cmd != nil && p.cmd.Process != nil {
 		log.Printf("Stopping llama-server (pid %d)", p.cmd.Process.Pid)
+		close(p.stopCh) // signal pollForReady to stop
 		// Try graceful shutdown first
 		if err := p.cmd.Process.Signal(softTermSignal); err != nil {
 			// Force kill
@@ -184,7 +233,6 @@ func (p *Process) stop() error {
 	}
 
 	p.state = StateStopped
-	close(p.stopCh)
 	return nil
 }
 
@@ -233,41 +281,17 @@ func (p *Process) buildArgs() []string {
 	}
 
 	if p.config.FlashAttention {
-		args = append(args, "--flash-attn")
+		args = append(args, "--flash-attn", "auto")
 	}
 
 	if p.config.MLock {
 		args = append(args, "--mlock")
 	}
 
-	// Enable JSON output for structured logging
-	args = append(args, "--log-format", "json")
-
 	return args
 }
 
-func (p *Process) waitForReady(stdout io.Reader, readyCh chan<- error) {
-	scanner := bufio.NewScanner(stdout)
-	for scanner.Scan() {
-		line := scanner.Text()
-		log.Printf("[llama-server] %s", line)
 
-		// Detect server ready
-		if containsSubstring(line, "starting the server") ||
-			containsSubstring(line, "server listening") ||
-			containsSubstring(line, "model loaded") {
-			readyCh <- nil
-			return
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		readyCh <- fmt.Errorf("stdout read: %w", err)
-		return
-	}
-
-	readyCh <- fmt.Errorf("process exited before becoming ready")
-}
 
 func (p *Process) monitorProcess() {
 	defer close(p.doneCh)
@@ -293,16 +317,4 @@ func (p *Process) setState(state State) {
 // softTermSignal returns SIGTERM for graceful shutdown.
 var softTermSignal = syscall.SIGTERM
 
-// containsSubstring reports whether substr is within s.
-func containsSubstring(s, substr string) bool {
-	return len(s) >= len(substr) && searchSubstring(s, substr)
-}
 
-func searchSubstring(s, substr string) bool {
-	for i := 0; i <= len(s)-len(substr); i++ {
-		if s[i:i+len(substr)] == substr {
-			return true
-		}
-	}
-	return false
-}

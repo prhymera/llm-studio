@@ -3,9 +3,11 @@
 package api
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"strings"
@@ -208,6 +210,16 @@ func (s *Server) handleGetModel(w http.ResponseWriter, r *http.Request, name str
 }
 
 func (s *Server) handleChatCompletion(w http.ResponseWriter, r *http.Request) {
+	// Read raw body first (needed for proxying after parsing)
+	bodyBytes, err := io.ReadAll(r.Body)
+	r.Body.Close()
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{
+			"error": fmt.Sprintf("cannot read body: %v", err),
+		})
+		return
+	}
+
 	// Parse the request body
 	var req struct {
 		Model       string          `json:"model"`
@@ -217,12 +229,15 @@ func (s *Server) handleChatCompletion(w http.ResponseWriter, r *http.Request) {
 		Stream      bool            `json:"stream"`
 	}
 
-	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+	if err := json.Unmarshal(bodyBytes, &req); err != nil {
 		writeJSON(w, http.StatusBadRequest, map[string]string{
 			"error": fmt.Sprintf("invalid request: %v", err),
 		})
 		return
 	}
+
+	// Recreate body for proxying
+	r.Body = io.NopCloser(bytes.NewReader(bodyBytes))
 
 	// Determine if the requested model is local or remote
 	m, ok := s.reg.Get(req.Model)
@@ -402,7 +417,8 @@ func (s *Server) handleLoadModel(w http.ResponseWriter, r *http.Request, name st
 	s.reg.SetStatus(name, models.StatusLoading)
 	s.llama = llama.New(llamaCfg)
 
-	ctx, cancel := context.WithTimeout(r.Context(), 60*time.Second)
+	// Model loading can take 30s+ for large models
+	ctx, cancel := context.WithTimeout(r.Context(), 180*time.Second)
 	defer cancel()
 
 	if err := s.llama.Start(ctx); err != nil {

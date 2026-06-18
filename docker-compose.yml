@@ -30,7 +30,8 @@ services:
       BIND_IP: "0.0.0.0"
       MODELS_DIR: "/models"
       DATA_DIR: "/data"
-      LLAMACPP_BIN: "llama-server"
+      LLAMACPP_BIN: "/llama/bin/llama-server"
+      LD_LIBRARY_PATH: "/llama/bin"
       DEFAULT_MODEL: "${DEFAULT_MODEL:-}"
       MODEL_CONTEXT_SIZE: "${MODEL_CONTEXT_SIZE:-8192}"
       MODEL_THREADS: "${MODEL_THREADS:-4}"
@@ -54,13 +55,13 @@ services:
       # Persistent data for generated configs and logs
       - llm-studio-config:/data/config
       - llm-studio-logs:/data/logs
-      # llama-server binary — mount specific file, not whole dir (prevents shadowing)
-      - "${LLAMA_SERVER_PATH:-/usr/local/bin/llama-server}:/usr/local/bin/llama-server:ro"
+      # Models directory with GGUF files
+      - "${LLAMA_MODELS_DIR:-~/.local/share/llama-lab/models}:/models:ro"
     networks:
       - llm-studio-network
     restart: unless-stopped
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:3100/health"]
+      test: ["CMD", "curl", "-sf", "http://localhost:3100/health"]
       interval: 30s
       timeout: 5s
       retries: 3
