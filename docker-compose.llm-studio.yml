@@ -1,0 +1,65 @@
+# ─────────────────────────────────────────────────────────────
+# LLM Studio — Docker Compose services
+# Meant to be added to the main hedgefund docker-compose.yml
+# ─────────────────────────────────────────────────────────────
+
+services:
+  # ── Local LLM Gateway ──
+  # Thin Go service that manages llama.cpp model lifecycle
+  # and exposes an OpenAI-compatible API
+  llm-gateway:
+    build:
+      context: ./code/llm-gateway
+      dockerfile: Dockerfile
+    ports:
+      - "${BIND_IP:-0.0.0.0}:3100:3100"
+    environment:
+      - GATEWAY_PORT=3100
+      - MODELS_DIR=/models
+      - LLAMACPP_BIN=llama-server
+      # Remote API keys (passed through from main .env)
+      - DEEPSEEK_API_KEY=${DEXTER_DEEPSEEK_API_KEY:-}
+      - GEMINI_API_KEY=${DEXTER_GOOGLE_API_KEY:-}
+      - OPENAI_API_KEY=${DEXTER_OPENAI_API_KEY:-}
+    volumes:
+      # Mount local model files
+      - ${LLAMA_MODELS_DIR:-~/.local/share/llama-lab/models}:/models:ro
+      # Mount llama.cpp binary
+      - ${LLAMACPP_BIN_DIR:-/usr/local/bin}:/usr/local/bin:ro
+    networks:
+      - trading-network
+    restart: unless-stopped
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 256M
+
+  # ── Open WebUI (LLM Studio Frontend) ──
+  # Feature-rich chat interface with RAG, prompt library,
+  # multi-modal, and more
+  open-webui:
+    image: ghcr.io/open-webui/open-webui:main
+    ports:
+      - "${BIND_IP:-0.0.0.0}:3000:8080"
+    environment:
+      # Point to our gateway for local + remote models
+      - OPENAI_API_BASE_URL=http://llm-gateway:3100/v1
+      - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:-change-me-in-production}
+      - WEBUI_AUTH=true
+      - WEBUI_NAME=Frao LLM Studio
+      - WEBUI_DEFAULT_MODEL=qwen25-coder-7b
+    volumes:
+      - open-webui-data:/app/backend/data
+    networks:
+      - trading-network
+    restart: unless-stopped
+    depends_on:
+      - llm-gateway
+
+networks:
+  trading-network:
+    external: true
+
+volumes:
+  open-webui-data:
