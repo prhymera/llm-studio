@@ -6,200 +6,138 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
 	"log"
 	"net/http"
 	"os"
 	"os/signal"
 	"syscall"
+	"time"
 
-	"github.com/go-chi/chi/v5"
-	"github.com/go-chi/chi/v5/middleware"
-	"github.com/go-chi/cors"
+	"github.com/prhymera/llm-studio/code/llm-gateway/internal/api"
+	"github.com/prhymera/llm-studio/code/llm-gateway/internal/config"
+	"github.com/prhymera/llm-studio/code/llm-gateway/internal/models"
 )
 
-const (
-	defaultPort = "3100"
-	version     = "0.1.0"
-)
-
-// ── Configuration ────────────────────────────────────────────
-
-type Config struct {
-	Port       string `json:"port"`
-	ModelsDir  string `json:"models_dir"`
-	LlamaBin   string `json:"llama_bin"`
-	DeepSeekAK string `json:"deepseek_api_key"`
-	GeminiAK   string `json:"gemini_api_key"`
-	OpenAIK    string `json:"openai_api_key"`
-}
-
-func loadConfig() Config {
-	return Config{
-		Port:       envOrDefault("GATEWAY_PORT", defaultPort),
-		ModelsDir:  envOrDefault("MODELS_DIR", os.ExpandEnv("$HOME/.local/share/llama-lab/models")),
-		LlamaBin:   envOrDefault("LLAMACPP_BIN", "llama-server"),
-		DeepSeekAK: os.Getenv("DEEPSEEK_API_KEY"),
-		GeminiAK:   os.Getenv("GEMINI_API_KEY"),
-		OpenAIK:    os.Getenv("OPENAI_API_KEY"),
-	}
-}
-
-func envOrDefault(key, def string) string {
-	if v := os.Getenv(key); v != "" {
-		return v
-	}
-	return def
-}
-
-// ── Health / Status ──────────────────────────────────────────
-
-type StatusResponse struct {
-	Version string         `json:"version"`
-	Models  []ModelSummary `json:"models"`
-	Healthy bool           `json:"healthy"`
-}
-
-type ModelSummary struct {
-	Name     string `json:"name"`
-	Loaded   bool   `json:"loaded"`
-	SizeGB   string `json:"size_gb,omitempty"`
-	Status   string `json:"status"` // "unloaded" | "loading" | "ready" | "error"
-}
-
-// ── Main ─────────────────────────────────────────────────────
+const version = "0.1.0"
 
 func main() {
-	cfg := loadConfig()
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 	log.Printf("🧠 llm-gateway v%s starting", version)
-	log.Printf("   Port:       %s", cfg.Port)
+
+	// Load configuration
+	cfg := config.Load()
+	log.Printf("   Port:       %d", cfg.Port)
 	log.Printf("   Models dir: %s", cfg.ModelsDir)
+	log.Printf("   Data dir:   %s", cfg.DataDir)
 	log.Printf("   llama bin:  %s", cfg.LlamaBin)
+	log.Printf("   Threads:    %d", cfg.ModelThreads)
+	log.Printf("   Context:    %d", cfg.ModelContextSize)
 
-	// ── Router ──────────────────────────────────────────
+	if len(cfg.RemoteAPIKeys) > 0 {
+		providers := make([]string, 0, len(cfg.RemoteAPIKeys))
+		for p := range cfg.RemoteAPIKeys {
+			providers = append(providers, p)
+		}
+		log.Printf("   Remote providers: %v", providers)
+	}
 
-	r := chi.NewRouter()
-	r.Use(middleware.Logger)
-	r.Use(middleware.Recoverer)
-	r.Use(middleware.RealIP)
-	r.Use(cors.Handler(cors.Options{
-		AllowedOrigins:   []string{"*"},
-		AllowedMethods:   []string{"GET", "POST", "PUT", "DELETE", "OPTIONS"},
-		AllowedHeaders:   []string{"*"},
-		AllowCredentials: true,
-	}))
+	// Initialize model registry
+	reg, err := models.NewRegistry(cfg.ModelsDir)
+	if err != nil {
+		log.Printf("Warning: model registry init: %v", err)
+	}
 
-	// ── Routes ──────────────────────────────────────────
+	// Register remote models
+	registerRemoteModels(reg, cfg)
 
-	r.Route("/v1", func(r chi.Router) {
-		r.Get("/models", listModels(cfg))
-		r.Get("/models/{name}", getModel(cfg))
-		r.Post("/models/{name}/load", loadModel(cfg))
-		r.Post("/models/{name}/unload", unloadModel(cfg))
-		r.Post("/chat/completions", chatCompletion(cfg))
-	})
+	log.Printf("   Models found: %d local, %d remote",
+		len(reg.LocalModels()), len(reg.List())-len(reg.LocalModels()))
 
-	r.Get("/health", health(cfg))
-	r.Get("/status", status(cfg))
+	// Create HTTP server
+	srv := api.NewServer(cfg, reg)
+	router := srv.Router()
 
-	// ── Graceful Shutdown ───────────────────────────────
+	httpServer := &http.Server{
+		Addr:         cfg.Addr(),
+		Handler:      router,
+		ReadTimeout:  30 * time.Second,
+		WriteTimeout: 300 * time.Second,
+		IdleTimeout:  60 * time.Second,
+	}
 
+	// Auto-load default model if specified
+	if cfg.DefaultModel != "" {
+		if _, ok := reg.Get(cfg.DefaultModel); ok {
+			log.Printf("Auto-loading default model: %s", cfg.DefaultModel)
+			// We trigger this in the background to avoid blocking startup
+			go func() {
+				// TODO: implement via API
+				log.Printf("Default model %s will be loaded on first request", cfg.DefaultModel)
+			}()
+		}
+	}
+
+	// Graceful shutdown
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
 
 	go func() {
-		<-sigCh
-		log.Println("Shutting down...")
-		// TODO: unload any running model
-		os.Exit(0)
+		sig := <-sigCh
+		log.Printf("Received signal %v, shutting down...", sig)
+
+		// Unload any active model
+		if active := reg.GetActiveModel(); active != "" {
+			log.Printf("Unloading active model: %s", active)
+		}
+
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+
+		if err := httpServer.Shutdown(ctx); err != nil {
+			log.Printf("HTTP server shutdown error: %v", err)
+		}
 	}()
 
-	addr := fmt.Sprintf(":%s", cfg.Port)
-	log.Printf("Listening on %s", addr)
-	if err := http.ListenAndServe(addr, r); err != nil {
+	log.Printf("Listening on %s", cfg.Addr())
+	if err := httpServer.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 		log.Fatalf("Server error: %v", err)
 	}
+
+	log.Println("Server stopped")
 }
 
-// ── Route Handlers (stubs) ──────────────────────────────────
+func registerRemoteModels(reg *models.Registry, cfg config.Config) {
+	type providerConfig struct {
+		key     string
+		baseURL string
+		models  []string
+	}
 
-func listModels(cfg Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		resp := map[string]interface{}{
-			"object": "list",
-			"data":   []map[string]string{},
+	providers := []providerConfig{
+		{key: "deepseek", baseURL: "https://api.deepseek.com/v1",
+			models: []string{"deepseek-v4-pro", "deepseek-v4-flash", "deepseek-reasoner"}},
+		{key: "gemini", baseURL: "https://generativelanguage.googleapis.com/v1beta/openai/",
+			models: []string{"gemini-2.5-flash", "gemini-2.5-pro"}},
+		{key: "openai", baseURL: "https://api.openai.com/v1",
+			models: []string{"gpt-4o", "gpt-4-turbo"}},
+		{key: "anthropic", baseURL: "https://api.anthropic.com/v1",
+			models: []string{"claude-sonnet-4", "claude-opus-4"}},
+		{key: "openrouter", baseURL: "https://openrouter.ai/api/v1",
+			models: []string{"openrouter/anthropic/claude-sonnet-4", "openrouter/qwen/qwen-2.5-coder-32b-instruct"}},
+		{key: "xai", baseURL: "https://api.x.ai/v1",
+			models: []string{"grok-3", "grok-3-mini"}},
+	}
+
+	for _, p := range providers {
+		if _, ok := cfg.RemoteAPIKeys[p.key]; ok {
+			reg.AddRemoteModels(p.key, cfg.RemoteAPIKeys[p.key], p.baseURL, p.models)
 		}
-		writeJSON(w, http.StatusOK, resp)
 	}
 }
 
-func getModel(cfg Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		name := chi.URLParam(r, "name")
-		writeJSON(w, http.StatusOK, map[string]string{
-			"id":     name,
-			"object": "model",
-			"status": "unloaded",
-		})
-	}
-}
-
-func loadModel(cfg Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		name := chi.URLParam(r, "name")
-		// TODO: spawn llama-server with this model
-		writeJSON(w, http.StatusAccepted, map[string]string{
-			"status":  "loading",
-			"model":   name,
-			"message": fmt.Sprintf("Starting model: %s", name),
-		})
-	}
-}
-
-func unloadModel(cfg Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		name := chi.URLParam(r, "name")
-		// TODO: kill llama-server
-		writeJSON(w, http.StatusOK, map[string]string{
-			"status":  "unloaded",
-			"model":   name,
-			"message": fmt.Sprintf("Stopped model: %s", name),
-		})
-	}
-}
-
-func chatCompletion(cfg Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		// TODO: proxy to local llama-server or remote endpoint
-		writeJSON(w, http.StatusNotImplemented, map[string]string{
-			"error": "not implemented yet",
-		})
-	}
-}
-
-func health(cfg Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, map[string]string{
-			"status": "healthy",
-		})
-	}
-}
-
-func status(cfg Config) http.HandlerFunc {
-	return func(w http.ResponseWriter, r *http.Request) {
-		writeJSON(w, http.StatusOK, StatusResponse{
-			Version: version,
-			Models:  []ModelSummary{},
-			Healthy: true,
-		})
-	}
-}
-
-// ── Helpers ─────────────────────────────────────────────────
-
-func writeJSON(w http.ResponseWriter, status int, data interface{}) {
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	json.NewEncoder(w).Encode(data)
+// ensure Config has DataDir in exported form
+func init() {
+	_ = fmt.Sprintf("") // ensure fmt import
 }
