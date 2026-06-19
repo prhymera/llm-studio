@@ -80,7 +80,7 @@ services:
       RUNNER_PORT: "3200"
       LLM_GATEWAY_URL: "http://llm-gateway:3100"
       DATA_DIR: "/data"
-      DEFAULT_MODEL: "${DEFAULT_MODEL:-deepseek-v4-pro}"
+      DEFAULT_MODEL: "${DEFAULT_MODEL:-qwen3-coder-30b-a3b}"
       DEFAULT_AGENT_TYPE: "${DEFAULT_AGENT_TYPE:-picoclaw}"
       AGENT_TIMEOUT: "${AGENT_TIMEOUT:-86400}"
       AGENT_CPU_LIMIT: "${AGENT_CPU_LIMIT:-4}"
