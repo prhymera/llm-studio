@@ -1,7 +1,7 @@
 // ─────────────────────────────────────────────────────────────
 // auth-bridge — SSO proxy for Open WebUI
-// Validates portal JWT, injects auth headers,
-// auto-provisions users in Open WebUI.
+// Validates portal session by calling backend's /auth/me endpoint,
+// injects auth headers, auto-provisions users in Open WebUI.
 // Part of the Frao Technologies LLM Studio
 // ─────────────────────────────────────────────────────────────
 
@@ -18,25 +18,23 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"strings"
 	"syscall"
 	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
-	"github.com/golang-jwt/jwt/v5"
 )
 
 const (
-	defaultPort = "3300"
-	version     = "0.1.0"
+	defaultPort  = "3300"
+	version      = "0.1.0"
 )
 
 // ── Configuration ────────────────────────────────────────────
 
 type Config struct {
 	Port           string
-	JWTSecret      string
+	BackendURL     string // Portal backend URL to validate sessions
 	OpenWebUIURL   string
 	OpenWebUIAdmin string
 }
@@ -44,7 +42,7 @@ type Config struct {
 func loadConfig() Config {
 	return Config{
 		Port:           envOrDefault("BRIDGE_PORT", defaultPort),
-		JWTSecret:      envOrDefault("JWT_SECRET", "change-me-in-production"),
+		BackendURL:     envOrDefault("BACKEND_URL", "http://backend:8080"),
 		OpenWebUIURL:   envOrDefault("OPEN_WEBUI_URL", "http://open-webui:8080"),
 		OpenWebUIAdmin: envOrDefault("OPEN_WEBUI_ADMIN_KEY", ""),
 	}
@@ -57,14 +55,24 @@ func envOrDefault(key, def string) string {
 	return def
 }
 
-// ── JWT Claims ──────────────────────────────────────────────
+// ── User Info (from backend /auth/me) ────────────────────────
 
-type PortalClaims struct {
-	UserID string `json:"user_id"`
-	Email  string `json:"email"`
-	Name   string `json:"name"`
-	Role   string `json:"role"`
-	jwt.RegisteredClaims
+type UserInfo struct {
+	ID       string `json:"id"`
+	Email    string `json:"email"`
+	Name     string `json:"full_name,omitempty"`
+	FullName string `json:"full_name,omitempty"`
+	Role     string `json:"role"`
+}
+
+func (u *UserInfo) displayName() string {
+	if u.Name != "" {
+		return u.Name
+	}
+	if u.FullName != "" {
+		return u.FullName
+	}
+	return u.Email
 }
 
 // ── Main ─────────────────────────────────────────────────────
@@ -72,64 +80,48 @@ type PortalClaims struct {
 func main() {
 	cfg := loadConfig()
 	log.Printf("🔐 auth-bridge v%s starting", version)
-	log.Printf("   Port:       %s", cfg.Port)
-	log.Printf("   OWUI URL:   %s", cfg.OpenWebUIURL)
+	log.Printf("   Port:     %s", cfg.Port)
+	log.Printf("   Backend:  %s", cfg.BackendURL)
+	log.Printf("   OWUI:     %s", cfg.OpenWebUIURL)
 
-	// Parse Open WebUI URL for reverse proxy
 	owuiURL, err := url.Parse(cfg.OpenWebUIURL)
 	if err != nil {
 		log.Fatalf("Invalid Open WebUI URL: %v", err)
 	}
 
-	// Create reverse proxy to Open WebUI
 	proxy := httputil.NewSingleHostReverseProxy(owuiURL)
-
-	// ── Router ──────────────────────────────────────────
 
 	r := chi.NewRouter()
 	r.Use(middleware.Logger)
 	r.Use(middleware.Recoverer)
 
-	// Health endpoint (no auth required)
 	r.Get("/health", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
 	})
 
-	// All other routes go through auth check then proxy to Open WebUI
 	r.HandleFunc("/*", func(w http.ResponseWriter, r *http.Request) {
-		// Extract JWT from cookie or Authorization header
-		tokenString := extractToken(r)
-		if tokenString == "" {
-			http.Redirect(w, r, "/login", http.StatusFound)
-			return
-		}
-
-		// Validate JWT
-		claims, err := validateToken(tokenString, cfg.JWTSecret)
+		// Validate session by calling the portal backend
+		user, err := validateSession(r, cfg.BackendURL)
 		if err != nil {
-			log.Printf("Auth failed: %v", err)
+			log.Printf("Session validation failed: %v", err)
 			http.Redirect(w, r, "/login", http.StatusFound)
 			return
 		}
 
-		// Auto-provision user in Open WebUI if needed
-		if err := provisionUser(claims, cfg.OpenWebUIURL, cfg.OpenWebUIAdmin); err != nil {
+		// Auto-provision user in Open WebUI
+		if err := provisionUser(user, cfg.OpenWebUIURL, cfg.OpenWebUIAdmin); err != nil {
 			log.Printf("Provision warning: %v", err)
-			// Non-fatal — user can still access with existing account
 		}
 
-		// Inject user headers for Open WebUI
-		r.Header.Set("X-User-Id", claims.UserID)
-		r.Header.Set("X-User-Email", claims.Email)
-		r.Header.Set("X-User-Name", claims.Name)
-		r.Header.Set("X-User-Role", claims.Role)
+		// Inject auth headers for Open WebUI
+		r.Header.Set("X-User-Id", user.ID)
+		r.Header.Set("X-User-Email", user.Email)
+		r.Header.Set("X-User-Name", user.displayName())
+		r.Header.Set("X-User-Role", user.Role)
 
-		// Proxy to Open WebUI
 		proxy.ServeHTTP(w, r)
 	})
-
-	// ── Graceful Shutdown ───────────────────────────────
 
 	sigCh := make(chan os.Signal, 1)
 	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -147,61 +139,64 @@ func main() {
 	}
 }
 
-// ── JWT Functions ───────────────────────────────────────────
+// ── Session Validation ───────────────────────────────────────
 
-func extractToken(r *http.Request) string {
-	// Check Authorization header first
-	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
-		return strings.TrimPrefix(auth, "Bearer ")
-	}
+func validateSession(r *http.Request, backendURL string) (*UserInfo, error) {
+	// Forward the request's cookies to the backend's /auth/me endpoint
+	meURL := fmt.Sprintf("%s/api/v1/auth/me", backendURL)
 
-	// Check cookie
-	if cookie, err := r.Cookie("session_jwt"); err == nil {
-		return cookie.Value
-	}
-
-	return ""
-}
-
-func validateToken(tokenString, secret string) (*PortalClaims, error) {
-	token, err := jwt.ParseWithClaims(tokenString, &PortalClaims{}, func(token *jwt.Token) (interface{}, error) {
-		if _, ok := token.Method.(*jwt.SigningMethodHMAC); !ok {
-			return nil, fmt.Errorf("unexpected signing method: %v", token.Header["alg"])
-		}
-		return []byte(secret), nil
-	})
+	req, err := http.NewRequest("GET", meURL, nil)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("create request: %w", err)
 	}
 
-	claims, ok := token.Claims.(*PortalClaims)
-	if !ok || !token.Valid {
-		return nil, fmt.Errorf("invalid token claims")
+	// Copy cookies from the original request
+	for _, c := range r.Cookies() {
+		req.AddCookie(c)
 	}
 
-	return claims, nil
+	client := &http.Client{Timeout: 5 * time.Second}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("backend request: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusUnauthorized {
+		return nil, fmt.Errorf("unauthorized")
+	}
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("backend returned %d", resp.StatusCode)
+	}
+
+	var user UserInfo
+	if err := json.NewDecoder(resp.Body).Decode(&user); err != nil {
+		return nil, fmt.Errorf("decode user: %w", err)
+	}
+
+	if user.ID == "" {
+		return nil, fmt.Errorf("empty user id")
+	}
+
+	return &user, nil
 }
 
 // ── User Provisioning ───────────────────────────────────────
 
-type OWUIUser struct {
-	ID      string `json:"id"`
-	Email   string `json:"email"`
-	Name    string `json:"name"`
-	Role    string `json:"role"`
-}
-
-func provisionUser(claims *PortalClaims, owuiURL, adminKey string) error {
+func provisionUser(user *UserInfo, owuiURL, adminKey string) error {
 	if adminKey == "" {
-		return nil // No admin key configured, skip provisioning
+		return nil
 	}
 
-	// Check if user exists
-	req, _ := http.NewRequest("GET", fmt.Sprintf("%s/api/v1/users/-/email?email=%s", owuiURL, claims.Email), nil)
-	req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", adminKey))
-
 	client := &http.Client{Timeout: 5 * time.Second}
-	resp, err := client.Do(req)
+	email := user.Email
+
+	// Check if user exists
+	checkReq, _ := http.NewRequest("GET",
+		fmt.Sprintf("%s/api/v1/users/-/email?email=%s", owuiURL, url.QueryEscape(email)), nil)
+	checkReq.Header.Set("Authorization", fmt.Sprintf("Bearer %s", adminKey))
+
+	resp, err := client.Do(checkReq)
 	if err != nil {
 		return fmt.Errorf("check user: %w", err)
 	}
@@ -209,9 +204,12 @@ func provisionUser(claims *PortalClaims, owuiURL, adminKey string) error {
 
 	if resp.StatusCode == http.StatusOK {
 		// User exists — update role if needed
-		var existing OWUIUser
+		var existing struct {
+			ID   string `json:"id"`
+			Role string `json:"role"`
+		}
 		json.NewDecoder(resp.Body).Decode(&existing)
-		mappedRole := mapRole(claims.Role)
+		mappedRole := mapRole(user.Role)
 		if existing.Role != mappedRole {
 			updateReq, _ := http.NewRequest("POST",
 				fmt.Sprintf("%s/api/v1/users/%s/role", owuiURL, existing.ID),
@@ -225,10 +223,10 @@ func provisionUser(claims *PortalClaims, owuiURL, adminKey string) error {
 
 	// Create new user
 	body, _ := json.Marshal(map[string]string{
-		"email":    claims.Email,
-		"password": generatePassword(),
-		"name":     claims.Name,
-		"role":     mapRole(claims.Role),
+		"email":    email,
+		"password": fmt.Sprintf("auto-%d", time.Now().UnixNano()),
+		"name":     user.displayName(),
+		"role":     mapRole(user.Role),
 	})
 
 	createReq, _ := http.NewRequest("POST", fmt.Sprintf("%s/api/v1/users", owuiURL),
@@ -254,13 +252,7 @@ func mapRole(portalRole string) string {
 	switch portalRole {
 	case "superadmin", "admin":
 		return "admin"
-	case "operator":
-		return "user"
 	default:
 		return "user"
 	}
-}
-
-func generatePassword() string {
-	return fmt.Sprintf("auto-%d", time.Now().UnixNano())
 }
