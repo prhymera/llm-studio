@@ -1,11 +1,12 @@
-#!/bin/sh
+#!/bin/bash
 # ─────────────────────────────────────────────────────────────
 # opencode agent entrypoint
+# Configures the environment and drops into an interactive shell.
 # ─────────────────────────────────────────────────────────────
-set -euo
+set -euo pipefail
 
-mkdir -p /etc/agent
-cat > /etc/agent/config.json <<CONFIGEOF
+mkdir -p /workspace/.agent
+cat > /workspace/.agent/config.json <<CONFIGEOF
 {
   "llm_endpoint": "${LLM_ENDPOINT:-http://llm-gateway:3100/v1}",
   "llm_model": "${LLM_MODEL:-qwen25-coder-7b}",
@@ -16,19 +17,20 @@ cat > /etc/agent/config.json <<CONFIGEOF
 }
 CONFIGEOF
 
-echo "=== opencode agent session ${SESSION_ID} ==="
-echo "Model: ${LLM_MODEL}"
-echo "Endpoint: ${LLM_ENDPOINT}"
-echo "Workspace: ${WORKSPACE}"
+echo "═══════════════════════════════════════════"
+echo "  opencode agent session ${SESSION_ID}"
+echo "═══════════════════════════════════════════"
+echo "  Model:    ${LLM_MODEL}"
+echo "  Endpoint: ${LLM_ENDPOINT}"
+echo "  Workspace: ${WORKSPACE}"
+echo ""
+echo "  opencode is available in PATH."
+echo ""
+echo "═══════════════════════════════════════════"
 echo ""
 
 if [ -f /workspace/.agentrc ]; then
-  . /workspace/.agentrc
+  source /workspace/.agentrc
 fi
 
-if command -v opencode >/dev/null 2>&1; then
-  exec opencode --model "${LLM_MODEL}" --api-base "${LLM_ENDPOINT}" "$@"
-else
-  echo "opencode is not installed. Starting shell."
-  exec /bin/sh
-fi
+exec /bin/bash

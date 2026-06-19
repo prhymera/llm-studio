@@ -102,6 +102,9 @@ func (m *Manager) CreateSession(ctx context.Context, agentType, model, label str
 	imageName := fmt.Sprintf("llm-studio-agent-%s:latest", agentType)
 	containerName := fmt.Sprintf("agent-%s-%s", userID[:8], sessID[:12])
 
+	// Remove any existing container with the same name (from previous failed sessions)
+	m.cli.ContainerRemove(ctx, containerName, container.RemoveOptions{Force: true})
+
 	env := []string{
 		fmt.Sprintf("LLM_ENDPOINT=%s/v1", m.cfg.GatewayURL),
 		fmt.Sprintf("LLM_MODEL=%s", model),
@@ -112,9 +115,11 @@ func (m *Manager) CreateSession(ctx context.Context, agentType, model, label str
 	}
 
 	resp, err := m.cli.ContainerCreate(ctx, &container.Config{
-		Image: imageName,
-		Env:   env,
-		Cmd:   []string{},
+		Image:        imageName,
+		Env:          env,
+		Cmd:          []string{},
+		OpenStdin:    true,
+		Tty:          true,
 		Labels: map[string]string{
 			"llm-studio.component":  "agent",
 			"llm-studio.user":       userID,
@@ -130,7 +135,8 @@ func (m *Manager) CreateSession(ctx context.Context, agentType, model, label str
 			CPUCount: int64(m.cfg.CPULimit),
 		},
 		ReadonlyRootfs: true,
-		NetworkMode: container.NetworkMode(m.effectiveNetwork()),
+		Tmpfs:          map[string]string{"/tmp": "rw,noexec,nosuid,size=64m"},
+		NetworkMode:    container.NetworkMode(m.effectiveNetwork()),
 	}, nil, nil, containerName)
 	if err != nil {
 		os.RemoveAll(workspacePath)

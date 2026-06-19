@@ -1,14 +1,15 @@
 #!/bin/bash
 # ─────────────────────────────────────────────────────────────
 # picoclaw agent entrypoint
-# Injects configuration from environment variables
-# and launches the agent.
+# Configures the environment and drops into an interactive shell.
+# The container stays alive so the user can interact via the
+# WebSocket terminal at any time.
 # ─────────────────────────────────────────────────────────────
 set -euo pipefail
 
 # Write agent config
-mkdir -p /etc/agent
-cat > /etc/agent/config.json <<CONFIGEOF
+mkdir -p /workspace/.agent
+cat > /workspace/.agent/config.json <<CONFIGEOF
 {
   "llm_endpoint": "${LLM_ENDPOINT:-http://llm-gateway:3100/v1}",
   "llm_model": "${LLM_MODEL:-qwen25-coder-7b}",
@@ -19,20 +20,28 @@ cat > /etc/agent/config.json <<CONFIGEOF
 }
 CONFIGEOF
 
-echo "=== picoclaw agent session ${SESSION_ID} ==="
-echo "Model: ${LLM_MODEL}"
-echo "Endpoint: ${LLM_ENDPOINT}"
-echo "Workspace: ${WORKSPACE}"
+echo "═══════════════════════════════════════════"
+echo "  picoclaw agent session ${SESSION_ID}"
+echo "═══════════════════════════════════════════"
+echo "  Model:    ${LLM_MODEL}"
+echo "  Endpoint: ${LLM_ENDPOINT}"
+echo "  Workspace: ${WORKSPACE}"
+echo ""
+echo "  picoclaw is available in PATH."
+echo "  Run it manually with your task description."
+echo ""
+echo "  Example:"
+echo "    picoclaw --model ${LLM_MODEL} \\"
+echo "      --project-root ${WORKSPACE} \\"
+echo "      'Write a Python function to merge two sorted lists'"
+echo ""
+echo "═══════════════════════════════════════════"
 echo ""
 
-# Restore .agentrc if it exists
+# Source workspace config if present
 if [ -f /workspace/.agentrc ]; then
   source /workspace/.agentrc
-  echo "Restored workspace configuration."
 fi
 
-# Launch picoclaw with project context
-exec picoclaw --model "${LLM_MODEL}" --provider "$(echo ${LLM_ENDPOINT} | sed 's|http://||;s|:.*||')" \
-  --api-key "${LLM_API_KEY}" \
-  --project-root "${WORKSPACE}" \
-  "$@"
+# Keep the container alive with an interactive bash shell
+exec /bin/bash
