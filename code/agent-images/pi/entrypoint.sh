@@ -3,7 +3,8 @@
 # pi.dev agent entrypoint
 # Configures the environment and drops into an interactive shell.
 # ─────────────────────────────────────────────────────────────
-set -eu
+set +e
+export HOME=/root
 
 mkdir -p /workspace/.agent
 cat > /workspace/.agent/config.json <<CONFIGEOF
@@ -16,6 +17,21 @@ cat > /workspace/.agent/config.json <<CONFIGEOF
   "workspace": "${WORKSPACE:-/workspace}"
 }
 CONFIGEOF
+
+# Write pi config to workspace (rootfs may be read-only)
+cat > /workspace/.agent/pi-config.json <<PICONFIG
+{
+  "models": {
+    "default": "${LLM_MODEL:-qwen25-coder-7b}",
+    "providers": {
+      "openai": {
+        "api_key": "${LLM_API_KEY:-local}",
+        "base_url": "${LLM_ENDPOINT:-http://llm-gateway:3100/v1}"
+      }
+    }
+  }
+}
+PICONFIG
 
 echo "═══════════════════════════════════════════"
 echo "  pi.dev agent session ${SESSION_ID}"

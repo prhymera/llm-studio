@@ -4,7 +4,8 @@
 # Configures the environment, launches picoclaw agent in
 # interactive mode, then falls back to bash if it exits.
 # ─────────────────────────────────────────────────────────────
-set -euo pipefail
+# Container must stay alive for terminal reconnection
+set +eu
 
 # Write agent config
 mkdir -p /workspace/.agent
@@ -18,6 +19,22 @@ cat > /workspace/.agent/config.json <<CONFIGEOF
   "workspace": "${WORKSPACE:-/workspace}"
 }
 CONFIGEOF
+
+# Write picoclaw config with the LLM endpoint as an OpenAI-compatible provider
+mkdir -p /root/.picoclaw
+cat > /root/.picoclaw/config.json <<PICOCONFIG
+{
+  "model_list": [
+    {
+      "provider": "openai",
+      "model_name": "${LLM_MODEL:-qwen25-coder-7b}",
+      "model": "${LLM_MODEL:-qwen25-coder-7b}",
+      "api_key": "${LLM_API_KEY:-local}",
+      "api_base": "${LLM_ENDPOINT:-http://llm-gateway:3100/v1}"
+    }
+  ]
+}
+PICOCONFIG
 
 echo "═══════════════════════════════════════════"
 echo "  picoclaw agent session ${SESSION_ID}"
@@ -34,6 +51,7 @@ if [ -f /workspace/.agentrc ]; then
 fi
 
 # Launch picoclaw agent in interactive mode.
+# Config file at /root/.picoclaw/config.json tells picoclaw about the LLM endpoint.
 # If TASK env var is set, send it as the first message.
 # If picoclaw exits, container stays alive via bash for debugging.
 if [ -n "${TASK:-}" ]; then

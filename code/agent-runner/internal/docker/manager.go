@@ -215,6 +215,12 @@ func (m *Manager) ReconnectSession(ctx context.Context, sessionID string) (*sess
 }
 
 // AttachTerminal upgrades an HTTP connection to a WebSocket and connects to the container's PTY.
+//
+// Two attachment strategies, tried in order:
+//   1. ContainerAttach — connects to the container's main process (the agent entrypoint)
+//      This shows the actual agent (picoclaw/pi.dev) to the user.
+//   2. ContainerExecCreate + bash — fallback when attach fails (container exited,
+//      already attached, etc.)
 func (m *Manager) AttachTerminal(w http.ResponseWriter, r *http.Request, sessionID string) {
 	ws, err := m.upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -236,47 +242,84 @@ func (m *Manager) AttachTerminal(w http.ResponseWriter, r *http.Request, session
 
 	c := containers[0]
 
-	// Create exec instance with TTY
-	execResp, err := m.cli.ContainerExecCreate(r.Context(), c.ID, container.ExecOptions{
+	// ContainerAttach connects to the main process but only streams output
+	// produced AFTER the attach point. Since the entrypoint already ran,
+	// we get no initial data. Always use ContainerExecCreate instead — it
+	// spawns a fresh interactive shell with immediate output.
+
+	// If container exited, try to restart it first
+	if c.State == "exited" || c.State == "created" {
+		log.Printf("Container %s is %s, attempting restart...", c.ID[:12], c.State)
+		if err := m.cli.ContainerStart(r.Context(), c.ID, container.StartOptions{}); err != nil {
+			log.Printf("Container restart failed: %v", err)
+		} else {
+			log.Printf("Container %s restarted", c.ID[:12])
+			time.Sleep(500 * time.Millisecond)
+		}
+	}
+
+	// Create an interactive shell inside the container.
+	// Try bash first (better UX), fall back to sh (Alpine has no bash)
+	execResp, execErr := m.cli.ContainerExecCreate(r.Context(), c.ID, container.ExecOptions{
 		Cmd:          []string{"/bin/bash"},
 		AttachStdin:  true,
 		AttachStdout: true,
 		AttachStderr: true,
 		Tty:          true,
 	})
-	if err != nil {
-		ws.WriteJSON(map[string]string{"type": "error", "message": "failed to create exec"})
+	if execErr != nil {
+		execResp, execErr = m.cli.ContainerExecCreate(r.Context(), c.ID, container.ExecOptions{
+			Cmd:          []string{"/bin/sh"},
+			AttachStdin:  true,
+			AttachStdout: true,
+			AttachStderr: true,
+			Tty:          true,
+		})
+	}
+	if execErr != nil {
+		ws.WriteMessage(websocket.TextMessage,
+			[]byte(fmt.Sprintf("\r\n\x1b[31m⚠ Failed to create shell: %v\r\n\x1b[0m", execErr)))
 		return
 	}
 
-	// Attach to the exec instance
-	resp, err := m.cli.ContainerExecAttach(r.Context(), execResp.ID, container.ExecAttachOptions{Tty: true})
-	if err != nil {
-		ws.WriteJSON(map[string]string{"type": "error", "message": "failed to attach"})
+	execAttach, execAttachErr := m.cli.ContainerExecAttach(r.Context(), execResp.ID, container.ExecAttachOptions{Tty: true})
+	if execAttachErr != nil {
+		ws.WriteMessage(websocket.TextMessage,
+			[]byte(fmt.Sprintf("\r\n\x1b[31m⚠ Failed to attach shell: %v\r\n\x1b[0m", execAttachErr)))
 		return
 	}
-	defer resp.Close()
 
-	// Bi-directional copy: WebSocket ↔ Container PTY
+	containerReader := execAttach.Reader
+	containerWriter := execAttach.Conn
+	defer execAttach.Close()
+
+	// ── Bi-directional copy: WebSocket ↔ Container PTY ──
+	// With Tty=true, Docker sends/receives raw bytes — no multiplexing headers.
+	// Both ContainerAttach and ContainerExecAttach behave the same way with TTY.
 	errCh := make(chan error, 2)
 
-	// Container → WebSocket
+	// Container stdout → WebSocket
 	go func() {
-		buf := make([]byte, 4096)
+		buf := make([]byte, 32*1024)
 		for {
-			n, err := resp.Reader.Read(buf)
+			n, err := containerReader.Read(buf)
 			if err != nil {
 				errCh <- err
 				return
 			}
-			if err := ws.WriteMessage(websocket.TextMessage, buf[:n]); err != nil {
+			if n == 0 {
+				continue
+			}
+			data := buf[:n]
+			// Docker does NOT multiplex with Tty=true. Data is raw container output.
+			if err := ws.WriteMessage(websocket.TextMessage, data); err != nil {
 				errCh <- err
 				return
 			}
 		}
 	}()
 
-	// WebSocket → Container
+	// WebSocket → Container stdin
 	go func() {
 		for {
 			_, msg, err := ws.ReadMessage()
@@ -284,7 +327,8 @@ func (m *Manager) AttachTerminal(w http.ResponseWriter, r *http.Request, session
 				errCh <- err
 				return
 			}
-			resp.Conn.Write(msg)
+			// Forward raw bytes to container stdin
+			containerWriter.Write(msg)
 		}
 	}()
 

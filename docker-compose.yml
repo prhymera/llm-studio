@@ -120,10 +120,13 @@ services:
       - "${BIND_IP:-0.0.0.0}:3300:3300"
     environment:
       BRIDGE_PORT: "3300"
-      # Use 10.128.0.5 (VPS LAN IP) because backend is on a different Docker network
+      # Use 10.64.0.5 (VPS LAN IP) because backend is on a different Docker network
       BACKEND_URL: "http://10.64.0.5:8080"
       OPEN_WEBUI_URL: "http://open-webui:8080"
-      OPEN_WEBUI_ADMIN_KEY: "${WEBUI_ADMIN_KEY:-}"
+      OWUI_DB_PATH: "/owui-data/webui.db"
+    volumes:
+      # Mount Open WebUI's data volume for direct SQLite provisioning
+      - open-webui-data:/owui-data:rw
     networks:
       - llm-studio-network
     restart: unless-stopped
@@ -144,6 +147,8 @@ services:
       - OPENAI_API_BASE_URL=http://llm-gateway:3100/v1
       # Auth: trust headers from auth-bridge
       - WEBUI_AUTH_TRUST_HEADERS=true
+      - WEBUI_AUTH_TRUSTED_EMAIL_HEADER=X-User-Email
+      - WEBUI_AUTH_TRUSTED_NAME_HEADER=X-User-Name
       - WEBUI_SECRET_KEY=${WEBUI_SECRET_KEY:-change-me-in-production}
       - WEBUI_NAME=${WEBUI_NAME:-LLM Studio}
       - WEBUI_DEFAULT_MODEL=${DEFAULT_MODEL:-qwen25-coder-7b}
