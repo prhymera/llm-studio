@@ -19,13 +19,14 @@ import (
 
 // Config configures the Docker manager.
 type Config struct {
-	DataDir       string
-	GatewayURL    string
-	DefaultModel  string
-	DefaultAgent  string
-	AgentTimeout  int
-	CPULimit      int
-	MemoryLimit   string
+	DataDir        string
+	GatewayURL     string
+	DefaultModel   string
+	DefaultAgent   string
+	AgentTimeout   int
+	CPULimit       int
+	MemoryLimit    string
+	DockerNetwork  string
 }
 
 // Manager handles Docker container lifecycle for agent sessions.
@@ -129,7 +130,7 @@ func (m *Manager) CreateSession(ctx context.Context, agentType, model, label str
 			CPUCount: int64(m.cfg.CPULimit),
 		},
 		ReadonlyRootfs: true,
-		NetworkMode:    container.NetworkMode("trading-network"),
+		NetworkMode: container.NetworkMode(m.effectiveNetwork()),
 	}, nil, nil, containerName)
 	if err != nil {
 		os.RemoveAll(workspacePath)
@@ -326,6 +327,14 @@ func parseMemoryBytes(s string) int64 {
 	default:
 		return val
 	}
+}
+
+func (m *Manager) effectiveNetwork() string {
+	n := m.cfg.DockerNetwork
+	if n == "" {
+		return "llm-studio_llm-studio-network"
+	}
+	return n
 }
 
 func mapContainerToSession(c container.Summary) *session.Session {

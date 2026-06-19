@@ -30,14 +30,15 @@ const (
 // ── Configuration ────────────────────────────────────────────
 
 type Config struct {
-	Port           string
-	LLMGatewayURL  string
-	DataDir        string
-	DefaultModel   string
-	DefaultAgent   string
-	AgentTimeout   int // seconds
-	AgentCPULimit  int
+	Port             string
+	LLMGatewayURL    string
+	DataDir          string
+	DefaultModel     string
+	DefaultAgent     string
+	AgentTimeout     int // seconds
+	AgentCPULimit    int
 	AgentMemoryLimit string
+	DockerNetwork    string
 }
 
 func loadConfig() Config {
@@ -50,6 +51,7 @@ func loadConfig() Config {
 		AgentTimeout:     envInt("AGENT_TIMEOUT", 86400),
 		AgentCPULimit:    envInt("AGENT_CPU_LIMIT", 4),
 		AgentMemoryLimit: envOrDefault("AGENT_MEMORY_LIMIT", "4G"),
+		DockerNetwork:    envOrDefault("DOCKER_NETWORK", "llm-studio_llm-studio-network"),
 	}
 }
 
@@ -94,6 +96,7 @@ func main() {
 		AgentTimeout:   cfg.AgentTimeout,
 		CPULimit:       cfg.AgentCPULimit,
 		MemoryLimit:    cfg.AgentMemoryLimit,
+		DockerNetwork:  cfg.DockerNetwork,
 	})
 	if err != nil {
 		log.Fatalf("Failed to initialize Docker manager: %v", err)

@@ -85,6 +85,7 @@ services:
       AGENT_TIMEOUT: "${AGENT_TIMEOUT:-86400}"
       AGENT_CPU_LIMIT: "${AGENT_CPU_LIMIT:-4}"
       AGENT_MEMORY_LIMIT: "${AGENT_MEMORY_LIMIT:-4G}"
+      DOCKER_NETWORK: "${DOCKER_NETWORK:-llm-studio_llm-studio-network}"
     volumes:
       # Docker socket for spawning agent containers
       - /var/run/docker.sock:/var/run/docker.sock:rw
@@ -119,7 +120,8 @@ services:
       - "${BIND_IP:-0.0.0.0}:3300:3300"
     environment:
       BRIDGE_PORT: "3300"
-      JWT_SECRET: "${JWT_SECRET:-change-me-in-production}"
+      # Use 10.128.0.5 (VPS LAN IP) because backend is on a different Docker network
+      BACKEND_URL: "http://10.64.0.5:8080"
       OPEN_WEBUI_URL: "http://open-webui:8080"
       OPEN_WEBUI_ADMIN_KEY: "${WEBUI_ADMIN_KEY:-}"
     networks:
