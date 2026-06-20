@@ -71,10 +71,25 @@ func main() {
 	if cfg.DefaultModel != "" {
 		if _, ok := reg.Get(cfg.DefaultModel); ok {
 			log.Printf("Auto-loading default model: %s", cfg.DefaultModel)
-			// We trigger this in the background to avoid blocking startup
 			go func() {
-				// TODO: implement via API
-				log.Printf("Default model %s will be loaded on first request", cfg.DefaultModel)
+				addr := fmt.Sprintf("http://%s/v1/models/%s/load", cfg.Addr(), cfg.DefaultModel)
+				// Retry up to 30s (server might not be ready immediately)
+				for i := 0; i < 30; i++ {
+					time.Sleep(1 * time.Second)
+					resp, err := http.Post(addr, "application/json", nil)
+					if err != nil {
+						continue
+					}
+					resp.Body.Close()
+					if resp.StatusCode == 200 {
+						log.Printf("Default model %s loaded successfully", cfg.DefaultModel)
+						return
+					}
+					if resp.StatusCode != 409 { // 409 = already loading/loaded
+						log.Printf("Load model returned %d, retrying...", resp.StatusCode)
+					}
+				}
+				log.Printf("Failed to auto-load model %s after 30s", cfg.DefaultModel)
 			}()
 		}
 	}

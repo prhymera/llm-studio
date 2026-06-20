@@ -117,6 +117,7 @@ func (m *Manager) CreateSession(ctx context.Context, agentType, model, label str
 		"WORKSPACE=/workspace",
 		fmt.Sprintf("USER_ID=%s", userID),
 		fmt.Sprintf("SESSION_ID=%s", sessID),
+		"TERM=xterm-256color",
 	}
 
 	resp, err := m.cli.ContainerCreate(ctx, &container.Config{
