@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"github.com/docker/docker/api/types/container"
@@ -216,11 +217,9 @@ func (m *Manager) ReconnectSession(ctx context.Context, sessionID string) (*sess
 
 // AttachTerminal upgrades an HTTP connection to a WebSocket and connects to the container's PTY.
 //
-// Two attachment strategies, tried in order:
-//   1. ContainerAttach — connects to the container's main process (the agent entrypoint)
-//      This shows the actual agent (picoclaw/pi.dev) to the user.
-//   2. ContainerExecCreate + bash — fallback when attach fails (container exited,
-//      already attached, etc.)
+// Strategy: exec the agent interpreter (picoclaw/pi/opencode) directly into the container
+// so the user sees the actual agent prompt, not a bash shell. Falls back to bash/sh
+// if the agent binary is unavailable.
 func (m *Manager) AttachTerminal(w http.ResponseWriter, r *http.Request, sessionID string) {
 	ws, err := m.upgrader.Upgrade(w, r, nil)
 	if err != nil {
@@ -242,12 +241,7 @@ func (m *Manager) AttachTerminal(w http.ResponseWriter, r *http.Request, session
 
 	c := containers[0]
 
-	// ContainerAttach connects to the main process but only streams output
-	// produced AFTER the attach point. Since the entrypoint already ran,
-	// we get no initial data. Always use ContainerExecCreate instead — it
-	// spawns a fresh interactive shell with immediate output.
-
-	// If container exited, try to restart it first
+	// If container exited, restart it first
 	if c.State == "exited" || c.State == "created" {
 		log.Printf("Container %s is %s, attempting restart...", c.ID[:12], c.State)
 		if err := m.cli.ContainerStart(r.Context(), c.ID, container.StartOptions{}); err != nil {
@@ -258,15 +252,57 @@ func (m *Manager) AttachTerminal(w http.ResponseWriter, r *http.Request, session
 		}
 	}
 
-	// Create an interactive shell inside the container.
-	// Try bash first (better UX), fall back to sh (Alpine has no bash)
+	// Extract agent type from container labels, model from env
+	agentType := c.Labels["llm-studio.agent-type"]
+	model := m.cfg.DefaultModel
+	if agentType == "" {
+		agentType = "picoclaw" // default
+	}
+
+	// Inspect container to get the actual model from env
+	insp, inspErr := m.cli.ContainerInspect(r.Context(), c.ID)
+	if inspErr == nil && insp.Config != nil {
+		for _, env := range insp.Config.Env {
+			if strings.HasPrefix(env, "LLM_MODEL=") {
+				model = strings.TrimPrefix(env, "LLM_MODEL=")
+				break
+			}
+		}
+	}
+
+	// Build the agent interpreter command based on agent type
+	var agentCmd []string
+	switch agentType {
+	case "picoclaw":
+		agentCmd = []string{"picoclaw", "agent", "--model", model}
+	case "pi":
+		agentCmd = []string{"pi", "--model", model, "--api-key", "local"}
+	case "opencode":
+		agentCmd = []string{"opencode", "--model", model}
+	default:
+		agentCmd = []string{"/bin/bash"}
+	}
+
+	log.Printf("Attaching terminal for %s (type=%s, model=%s): %v", c.ID[:12], agentType, model, agentCmd)
+
+	// Try the agent command first. If it fails (binary not found), fall back to bash/sh.
 	execResp, execErr := m.cli.ContainerExecCreate(r.Context(), c.ID, container.ExecOptions{
-		Cmd:          []string{"/bin/bash"},
+		Cmd:          agentCmd,
 		AttachStdin:  true,
 		AttachStdout: true,
 		AttachStderr: true,
 		Tty:          true,
 	})
+	if execErr != nil {
+		log.Printf("Agent exec failed (%v), falling back to bash/sh", execErr)
+		execResp, execErr = m.cli.ContainerExecCreate(r.Context(), c.ID, container.ExecOptions{
+			Cmd:          []string{"/bin/bash"},
+			AttachStdin:  true,
+			AttachStdout: true,
+			AttachStderr: true,
+			Tty:          true,
+		})
+	}
 	if execErr != nil {
 		execResp, execErr = m.cli.ContainerExecCreate(r.Context(), c.ID, container.ExecOptions{
 			Cmd:          []string{"/bin/sh"},
@@ -278,14 +314,14 @@ func (m *Manager) AttachTerminal(w http.ResponseWriter, r *http.Request, session
 	}
 	if execErr != nil {
 		ws.WriteMessage(websocket.TextMessage,
-			[]byte(fmt.Sprintf("\r\n\x1b[31m⚠ Failed to create shell: %v\r\n\x1b[0m", execErr)))
+			[]byte(fmt.Sprintf("\r\n\x1b[31m⚠ Failed to create agent shell: %v\r\n\x1b[0m", execErr)))
 		return
 	}
 
 	execAttach, execAttachErr := m.cli.ContainerExecAttach(r.Context(), execResp.ID, container.ExecAttachOptions{Tty: true})
 	if execAttachErr != nil {
 		ws.WriteMessage(websocket.TextMessage,
-			[]byte(fmt.Sprintf("\r\n\x1b[31m⚠ Failed to attach shell: %v\r\n\x1b[0m", execAttachErr)))
+			[]byte(fmt.Sprintf("\r\n\x1b[31m⚠ Failed to attach: %v\r\n\x1b[0m", execAttachErr)))
 		return
 	}
 
@@ -294,8 +330,6 @@ func (m *Manager) AttachTerminal(w http.ResponseWriter, r *http.Request, session
 	defer execAttach.Close()
 
 	// ── Bi-directional copy: WebSocket ↔ Container PTY ──
-	// With Tty=true, Docker sends/receives raw bytes — no multiplexing headers.
-	// Both ContainerAttach and ContainerExecAttach behave the same way with TTY.
 	errCh := make(chan error, 2)
 
 	// Container stdout → WebSocket
@@ -311,7 +345,6 @@ func (m *Manager) AttachTerminal(w http.ResponseWriter, r *http.Request, session
 				continue
 			}
 			data := buf[:n]
-			// Docker does NOT multiplex with Tty=true. Data is raw container output.
 			if err := ws.WriteMessage(websocket.TextMessage, data); err != nil {
 				errCh <- err
 				return
@@ -327,7 +360,6 @@ func (m *Manager) AttachTerminal(w http.ResponseWriter, r *http.Request, session
 				errCh <- err
 				return
 			}
-			// Forward raw bytes to container stdin
 			containerWriter.Write(msg)
 		}
 	}()
