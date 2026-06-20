@@ -206,8 +206,18 @@ func (r *Registry) LocalModels() []*Model {
 func (r *Registry) Get(id string) (*Model, bool) {
 	r.mu.RLock()
 	defer r.mu.RUnlock()
-	m, ok := r.models[id]
-	return m, ok
+	// Try exact match first
+	if m, ok := r.models[id]; ok {
+		return m, ok
+	}
+	// Try matching suffix (for remote models stored as 'provider/model')
+	// e.g., 'deepseek-v4-flash' should match 'deepseek/deepseek-v4-flash'
+	for key, m := range r.models {
+		if strings.HasSuffix(key, "/"+id) || strings.HasSuffix(key, id) {
+			return m, true
+		}
+	}
+	return nil, false
 }
 
 // SetStatus updates the status of a local model.
