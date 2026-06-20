@@ -2,8 +2,11 @@
 package docker
 
 import (
+	"bufio"
+	"bytes"
 	"context"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
@@ -239,7 +242,7 @@ func (m *Manager) AttachTerminal(w http.ResponseWriter, r *http.Request, session
 		),
 	})
 	if err != nil || len(containers) == 0 {
-		ws.WriteJSON(map[string]string{"type": "error", "message": "session not found"})
+		ws.WriteMessage(websocket.TextMessage, []byte(`{"type":"error","message":"session not found"}`))
 		return
 	}
 
@@ -290,9 +293,9 @@ func (m *Manager) AttachTerminal(w http.ResponseWriter, r *http.Request, session
 	log.Printf("Attaching terminal for %s (type=%s, model=%s): %v", c.ID[:12], agentType, model, agentCmd)
 
 	// Try commands in order until one works.
-	// ContainerExecCreate may succeed even if the binary doesn't exist in the container
-	// (Docker records the exec intent). The actual failure happens at attach time.
-	// So we must retry on EITHER create or attach failure.
+	// ContainerExecCreate may succeed even if the binary doesn't exist
+	// (Docker records intent). OCI errors come through the attach stream,
+	// not as attach errors. Read the first chunk to detect this.
 	cmdsToTry := [][]string{
 		agentCmd,
 		{"/bin/bash"},
@@ -303,6 +306,7 @@ func (m *Manager) AttachTerminal(w http.ResponseWriter, r *http.Request, session
 	var lastErr error
 	attachSucceeded := false
 
+readLoop:
 	for _, cmd := range cmdsToTry {
 		execResp, execErr := m.cli.ContainerExecCreate(r.Context(), c.ID, container.ExecOptions{
 			Cmd:          cmd,
@@ -325,6 +329,38 @@ func (m *Manager) AttachTerminal(w http.ResponseWriter, r *http.Request, session
 			continue
 		}
 
+		// Peek at the first bytes to detect OCI runtime errors
+		// (binary not found errors come through stream, not attach error)
+		execAttach.Conn.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+		peek := make([]byte, 512)
+		n, peekErr := execAttach.Reader.Read(peek)
+		// Reset deadline (clear for normal operation)
+		execAttach.Conn.SetReadDeadline(time.Time{})
+
+		ociError := false
+		if peekErr == nil && n > 0 {
+			chunk := strings.ToLower(string(peek[:n]))
+			if strings.Contains(chunk, "oci runtime") ||
+				strings.Contains(chunk, "exec: \"") ||
+				strings.Contains(chunk, "no such file or directory") ||
+				strings.Contains(chunk, "command not found") {
+				lastErr = fmt.Errorf("OCI exec error: %s", strings.TrimSpace(chunk))
+				ociError = true
+				log.Printf("OCI error for %v: %v, trying next", cmd, string(peek[:n]))
+			}
+		}
+
+		if ociError {
+			execAttach.Close()
+			continue readLoop
+		}
+
+		// If we got valid output, re-push the peeked bytes back
+		// (they contain real agent output like the picoclaw logo)
+		if peekErr == nil && n > 0 {
+			execAttach.Reader = bufio.NewReader(io.MultiReader(bytes.NewReader(peek[:n]), execAttach.Reader))
+		}
+
 		attachSucceeded = true
 		log.Printf("Terminal attached via: %v", cmd)
 		break
@@ -343,7 +379,8 @@ func (m *Manager) AttachTerminal(w http.ResponseWriter, r *http.Request, session
 	// ── Bi-directional copy: WebSocket ↔ Container PTY ──
 	errCh := make(chan error, 2)
 
-	// Container stdout → WebSocket
+	// Container stdout → WebSocket (BinaryMessage for terminal bytes — may contain
+	// non-UTF8 control sequences that would corrupt TextMessage frames)
 	go func() {
 		buf := make([]byte, 32*1024)
 		for {
@@ -356,7 +393,7 @@ func (m *Manager) AttachTerminal(w http.ResponseWriter, r *http.Request, session
 				continue
 			}
 			data := buf[:n]
-			if err := ws.WriteMessage(websocket.TextMessage, data); err != nil {
+			if err := ws.WriteMessage(websocket.BinaryMessage, data); err != nil {
 				errCh <- err
 				return
 			}
