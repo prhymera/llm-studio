@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/docker/docker/api/types"
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
@@ -136,7 +137,10 @@ func (m *Manager) CreateSession(ctx context.Context, agentType, model, label str
 			CPUCount: int64(m.cfg.CPULimit),
 		},
 		ReadonlyRootfs: true,
-		Tmpfs:          map[string]string{"/tmp": "rw,noexec,nosuid,size=64m"},
+		Tmpfs: map[string]string{
+			"/tmp":  "rw,noexec,nosuid,size=64m",
+			"/root": "rw,noexec,nosuid,size=4m", // for agent config files (~/.picoclaw/)
+		},
 		NetworkMode:    container.NetworkMode(m.effectiveNetwork()),
 	}, nil, nil, containerName)
 	if err != nil {
@@ -285,43 +289,50 @@ func (m *Manager) AttachTerminal(w http.ResponseWriter, r *http.Request, session
 
 	log.Printf("Attaching terminal for %s (type=%s, model=%s): %v", c.ID[:12], agentType, model, agentCmd)
 
-	// Try the agent command first. If it fails (binary not found), fall back to bash/sh.
-	execResp, execErr := m.cli.ContainerExecCreate(r.Context(), c.ID, container.ExecOptions{
-		Cmd:          agentCmd,
-		AttachStdin:  true,
-		AttachStdout: true,
-		AttachStderr: true,
-		Tty:          true,
-	})
-	if execErr != nil {
-		log.Printf("Agent exec failed (%v), falling back to bash/sh", execErr)
-		execResp, execErr = m.cli.ContainerExecCreate(r.Context(), c.ID, container.ExecOptions{
-			Cmd:          []string{"/bin/bash"},
-			AttachStdin:  true,
-			AttachStdout: true,
-			AttachStderr: true,
-			Tty:          true,
-		})
-	}
-	if execErr != nil {
-		execResp, execErr = m.cli.ContainerExecCreate(r.Context(), c.ID, container.ExecOptions{
-			Cmd:          []string{"/bin/sh"},
-			AttachStdin:  true,
-			AttachStdout: true,
-			AttachStderr: true,
-			Tty:          true,
-		})
-	}
-	if execErr != nil {
-		ws.WriteMessage(websocket.TextMessage,
-			[]byte(fmt.Sprintf("\r\n\x1b[31m⚠ Failed to create agent shell: %v\r\n\x1b[0m", execErr)))
-		return
+	// Try commands in order until one works.
+	// ContainerExecCreate may succeed even if the binary doesn't exist in the container
+	// (Docker records the exec intent). The actual failure happens at attach time.
+	// So we must retry on EITHER create or attach failure.
+	cmdsToTry := [][]string{
+		agentCmd,
+		{"/bin/bash"},
+		{"/bin/sh"},
 	}
 
-	execAttach, execAttachErr := m.cli.ContainerExecAttach(r.Context(), execResp.ID, container.ExecAttachOptions{Tty: true})
-	if execAttachErr != nil {
+	var execAttach types.HijackedResponse
+	var lastErr error
+	attachSucceeded := false
+
+	for _, cmd := range cmdsToTry {
+		execResp, execErr := m.cli.ContainerExecCreate(r.Context(), c.ID, container.ExecOptions{
+			Cmd:          cmd,
+			AttachStdin:  true,
+			AttachStdout: true,
+			AttachStderr: true,
+			Tty:          true,
+		})
+		if execErr != nil {
+			lastErr = execErr
+			log.Printf("Exec create failed for %v: %v, trying next", cmd, execErr)
+			continue
+		}
+
+		var attachErr error
+		execAttach, attachErr = m.cli.ContainerExecAttach(r.Context(), execResp.ID, container.ExecAttachOptions{Tty: true})
+		if attachErr != nil {
+			lastErr = attachErr
+			log.Printf("Exec attach failed for %v: %v, trying next", cmd, attachErr)
+			continue
+		}
+
+		attachSucceeded = true
+		log.Printf("Terminal attached via: %v", cmd)
+		break
+	}
+
+	if !attachSucceeded {
 		ws.WriteMessage(websocket.TextMessage,
-			[]byte(fmt.Sprintf("\r\n\x1b[31m⚠ Failed to attach: %v\r\n\x1b[0m", execAttachErr)))
+			[]byte(fmt.Sprintf("\r\n\x1b[31m⚠ Failed to attach terminal: %v\r\n\x1b[0m", lastErr)))
 		return
 	}
 
