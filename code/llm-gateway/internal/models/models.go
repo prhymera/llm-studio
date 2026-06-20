@@ -143,7 +143,9 @@ func (r *Registry) AddRemoteModels(providerName string, apiKey string, baseURL s
 	defer r.mu.Unlock()
 
 	for _, mid := range modelIDs {
-		id := fmt.Sprintf("%s/%s", providerName, mid)
+		// Use clean model name as ID (no provider prefix) so Open WebUI and
+		// other clients see 'deepseek-v4-flash' not 'deepseek/deepseek-v4-flash'
+		id := mid
 		r.models[id] = &Model{
 			ID:           id,
 			Name:         mid,
@@ -154,12 +156,16 @@ func (r *Registry) AddRemoteModels(providerName string, apiKey string, baseURL s
 	}
 
 	// Add to endpoints list
+	endpointModelIDs := make([]string, len(modelIDs))
+	for i, mid := range modelIDs {
+		endpointModelIDs[i] = mid // clean name, no prefix
+	}
 	r.endpoints = append(r.endpoints, Endpoint{
 		Name:      providerName,
 		Type:      "remote",
 		BaseURL:   baseURL,
 		APIKeyEnv: fmt.Sprintf("%s_API_KEY", strings.ToUpper(providerName)),
-		Models:    modelIDs,
+		Models:    endpointModelIDs,
 	})
 }
 

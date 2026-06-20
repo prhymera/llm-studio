@@ -250,11 +250,21 @@ func (s *Server) handleChatCompletion(w http.ResponseWriter, r *http.Request) {
 
 	if m.Provider == models.ProviderLocal {
 		// Route to local llama.cpp server
-		if s.llama == nil || !s.llama.IsRunning() {
-			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
-				"error": "no local model is currently loaded",
-			})
-			return
+		// Lazy-load the model if not running or wrong model is loaded
+		needsLoad := s.llama == nil || !s.llama.IsRunning()
+		if !needsLoad {
+			// Check if the current llama process serves the requested model
+			active := s.reg.GetActiveModel()
+			needsLoad = (active != req.Model)
+		}
+		if needsLoad {
+			log.Printf("Lazy-loading local model %s on demand (current: %v)", req.Model, s.reg.GetActiveModel())
+			if err := s.loadModel(req.Model); err != nil {
+				writeJSON(w, http.StatusInternalServerError, map[string]string{
+					"error": fmt.Sprintf("failed to load model: %v", err),
+				})
+				return
+			}
 		}
 		s.proxyToLocal(w, r, &req)
 	} else {
@@ -437,6 +447,63 @@ func (s *Server) handleLoadModel(w http.ResponseWriter, r *http.Request, name st
 		"status": "loaded",
 		"model":  name,
 	})
+}
+
+// loadModel starts a local model synchronously. Used by handleChatCompletion
+// for lazy-loading when a request arrives but the model isn't running yet.
+func (s *Server) loadModel(name string) error {
+	m, ok := s.reg.Get(name)
+	if !ok {
+		return fmt.Errorf("model '%s' not found", name)
+	}
+	if m.Provider != models.ProviderLocal {
+		return fmt.Errorf("can only load local models")
+	}
+	if m.Status == models.StatusReady {
+		return nil // already loaded
+	}
+
+	// Acquire semaphore (only one model loads at a time)
+	s.llamaMu <- struct{}{}
+	defer func() { <-s.llamaMu }()
+
+	// Re-check after acquiring lock (another goroutine might have loaded it)
+	m, ok = s.reg.Get(name)
+	if ok && m.Status == models.StatusReady {
+		return nil
+	}
+
+	// Stop existing process if any
+	if s.llama != nil && s.llama.IsRunning() {
+		if err := s.llama.Stop(); err != nil {
+			log.Printf("Error stopping previous model: %v", err)
+		}
+	}
+
+	llamaCfg := llama.DefaultConfig()
+	llamaCfg.BinaryPath = s.cfg.LlamaBin
+	llamaCfg.ModelPath = m.FilePath
+	llamaCfg.Host = "127.0.0.1"
+	llamaCfg.Port = 8080
+	llamaCfg.ContextSize = s.cfg.ModelContextSize
+	llamaCfg.Threads = s.cfg.ModelThreads
+	llamaCfg.GPULayers = s.cfg.ModelGPULayers
+
+	s.reg.SetStatus(name, models.StatusLoading)
+	s.llama = llama.New(llamaCfg)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+
+	if err := s.llama.Start(ctx); err != nil {
+		s.reg.SetStatus(name, models.StatusError)
+		s.llama = nil
+		return fmt.Errorf("failed to load model: %w", err)
+	}
+
+	s.reg.SetStatus(name, models.StatusReady)
+	log.Printf("Model %s loaded successfully (lazy)", name)
+	return nil
 }
 
 func (s *Server) handleUnloadModel(w http.ResponseWriter, r *http.Request, name string) {

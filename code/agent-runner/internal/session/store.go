@@ -122,7 +122,7 @@ func (s *Store) List() ([]*Session, error) {
 	}
 	defer rows.Close()
 
-	var sessions []*Session
+	sessions := make([]*Session, 0)
 	for rows.Next() {
 		sess := &Session{}
 		var created, lastActive, stopped sql.NullString
