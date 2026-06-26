@@ -6,23 +6,25 @@
 FROM node:22-alpine
 
 # Install build tools for native modules (node-pty etc.)
-RUN apk add --no-cache python3 make g++
+# and sudo for passwordless administration inside the container
+RUN apk add --no-cache python3 make g++ sudo
 
-# Install pi.dev CLI
+# ── Create service user ──
+# pi-agent owns all session processes, not root.
+# Home is /home/pi-agent (bind-mounted from workspace volume at runtime).
+RUN adduser -D -u 1100 -h /home/pi-agent pi-agent && \
+    echo "pi-agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/pi-agent && \
+    chmod 0440 /etc/sudoers.d/pi-agent
+
+# Install pi.dev CLI (globally, available to all users)
 RUN npm install -g --ignore-scripts @mariozechner/pi-coding-agent
 
 # Install pi packages (memory-stone, observational-memory)
-# These install into /usr/local/lib/node_modules/ (shared, not in tmpfs)
 RUN npm install -g pi-memory-stone pi-observational-memory
 
-# Pre-install pi-web.dev for one-click launch
-# Assets install to /root/.pi-web during build; entrypoint.sh copies them to
-# the workspace-backed /root at runtime (since /root is a bind mount that
-# shadows the image layer).
-# pi-web.dev: globally install the server binary + web UI assets.
-# pi-web install writes config/assets to ~/.pi-web;
-# stash them to /opt so entrypoint.sh can restore them to the
-# workspace-backed /root mount at runtime.
+# Pre-install pi-web.dev for one-click launch.
+# Build-time install writes assets to /root; stash to /opt so entrypoint.sh
+# can restore them to the workspace-backed /home/pi-agent at runtime.
 RUN npm install -g @jmfederico/pi-web && \
     pi-web install 2>/dev/null; \
     if [ -d /root/.pi-web ]; then cp -a /root/.pi-web /opt/pi-web-assets; fi

@@ -11,7 +11,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -101,23 +103,27 @@ func (m *Manager) CreateSession(ctx context.Context, agentType, model, label str
 	sessID := fmt.Sprintf("sess-%d", time.Now().UnixNano())
 	userID := extractUserID(ctx)
 
-	workspacePath := filepath.Join(m.cfg.DataDir, "workspaces", userID, sessID)
+	// ── Per-user persistent home (shared across all user's sessions) ──
+	userHomeDir := filepath.Join(m.cfg.DataDir, "workspaces", userID, "home")
+	if err := os.MkdirAll(userHomeDir, 0755); err != nil {
+		return nil, fmt.Errorf("create user home: %w", err)
+	}
+	os.MkdirAll(filepath.Join(userHomeDir, ".npm"), 0755)
+	os.MkdirAll(filepath.Join(userHomeDir, ".npm-global"), 0755)
+	os.MkdirAll(filepath.Join(userHomeDir, ".pi", "skills"), 0755)
+	os.MkdirAll(filepath.Join(userHomeDir, ".config"), 0755)
+
+	// ── Soft 15GB quota per user ──
+	userRoot := filepath.Join(m.cfg.DataDir, "workspaces", userID)
+	if err := enforceQuota(userRoot, 15*1024*1024*1024); err != nil {
+		return nil, err
+	}
+
+	// ── Session workspace (isolated, not shared) ──
+	workspacePath := filepath.Join(m.cfg.DataDir, "workspaces", userID, "sessions", sessID)
 	if err := os.MkdirAll(workspacePath, 0755); err != nil {
 		return nil, fmt.Errorf("create workspace: %w", err)
 	}
-
-	// Persistent home directories on workspace volume (disk, not tmpfs/RAM).
-	// tmpfs for /root was doubly wasteful: RAM for storage + RAM for runtime.
-	rootDir := filepath.Join(workspacePath, "home")
-	npmCacheDir := filepath.Join(rootDir, ".npm")
-	npmGlobalDir := filepath.Join(rootDir, ".npm-global")
-	os.MkdirAll(rootDir, 0755)
-	os.MkdirAll(npmCacheDir, 0755)
-	os.MkdirAll(npmGlobalDir, 0755)
-	os.MkdirAll(filepath.Join(rootDir, ".pi", "skills"), 0755)
-	// Create symlinks so pi can find frao-skills as ~/.pi/skills/<skill>
-	// (container /root is bind-mounted from rootDir which has the .pi/skills dir ready)
-	os.MkdirAll(filepath.Join(rootDir, ".config"), 0755)
 
 	imageName := fmt.Sprintf("llm-studio-agent-%s:latest", agentType)
 	containerName := fmt.Sprintf("agent-%s-%s", userID[:8], sessID[:12])
@@ -150,7 +156,7 @@ func (m *Manager) CreateSession(ctx context.Context, agentType, model, label str
 	}, &container.HostConfig{
 		Binds: []string{
 			fmt.Sprintf("%s:/workspace:rw", workspacePath),
-			fmt.Sprintf("%s:/root:rw", rootDir),
+			fmt.Sprintf("%s:/home/pi-agent:rw", userHomeDir),
 			fmt.Sprintf("%s:/frao-skills:ro", m.cfg.FraoSkillsPath),
 		},
 		Resources: container.Resources{
@@ -303,7 +309,7 @@ func (m *Manager) AttachTerminal(w http.ResponseWriter, r *http.Request, session
 		// --provider gateway routes ALL models through the LLM gateway
 		// (custom provider defined in /etc/pi-gateway-extension.js)
 		agentCmd = []string{"pi", "--provider", "gateway", "--model", model, "--api-key", "local",
-			"--extension", "/root/pi-gateway-extension.js"}
+			"--extension", "/root/.pi/extensions/gateway.js"}
 		// Preload frao-skills if available ("/frao-skills" mounted from host)
 		for _, skill := range m.discoverFraoSkills() {
 			agentCmd = append(agentCmd, "--skill", filepath.Join("/frao-skills", skill))
@@ -335,7 +341,9 @@ readLoop:
 	for _, cmd := range cmdsToTry {
 		var execErr error
 		execResp, execErr = m.cli.ContainerExecCreate(r.Context(), c.ID, container.ExecOptions{
+			User:         "1100", // run as pi-agent (not root)
 			Cmd:          cmd,
+			Env:          []string{"HOME=/home/pi-agent"},
 			AttachStdin:  true,
 			AttachStdout: true,
 			AttachStderr: true,
@@ -533,6 +541,37 @@ func mapContainerToSession(c container.Summary) *session.Session {
 		ContainerID: c.ID,
 		Status:      c.State,
 	}
+}
+
+// enforceQuota checks that a directory does not exceed the byte limit.
+// Uses du -s (block-level summary, fast) for soft enforcement.
+func enforceQuota(path string, limitBytes int64) error {
+	if _, err := os.Stat(path); os.IsNotExist(err) {
+		return nil // path doesn't exist yet, quota check passes
+	}
+	// du -s reports in 1024-byte blocks on Linux
+	cmd := exec.Command("du", "-s", "--block-size=1", path)
+	out, err := cmd.Output()
+	if err != nil {
+		// If du fails (e.g., path not available), allow creation
+		log.Printf("quota check: du failed for %s: %v — allowing", path, err)
+		return nil
+	}
+	fields := strings.Fields(string(out))
+	if len(fields) == 0 {
+		return nil
+	}
+	used, convErr := strconv.ParseInt(fields[0], 10, 64)
+	if convErr != nil {
+		log.Printf("quota check: cannot parse du output for %s: %v", path, convErr)
+		return nil
+	}
+	if used > limitBytes {
+		usedGB := float64(used) / (1024 * 1024 * 1024)
+		limitGB := float64(limitBytes) / (1024 * 1024 * 1024)
+		return fmt.Errorf("storage quota exceeded: %.1fGB used of %.0fGB limit — free up space", usedGB, limitGB)
+	}
+	return nil
 }
 
 // discoverFraoSkills returns the directory names of frao-skills available on the host.

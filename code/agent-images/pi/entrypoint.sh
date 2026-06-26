@@ -1,18 +1,24 @@
 #!/bin/sh
 # ─────────────────────────────────────────────────────────────
 # pi.dev agent entrypoint
-# Configures the environment and drops into an interactive shell.
+# Runs as root to configure environment, then drops to pi-agent.
 # ─────────────────────────────────────────────────────────────
 set +e
-export HOME=/root
+
+# ── Early: set home for the service user ──
+PI_HOME=/home/pi-agent
+export HOME="$PI_HOME"
 
 # ── Restore pi-web.dev assets from image layer ──
-# /root is a workspace volume bind mount at runtime, so build-time files
-# in /root/.pi-web are shadowed.  Copy them back from the image stash.
-if [ -d /opt/pi-web-assets ] && [ ! -d /root/.pi-web ]; then
-    cp -a /opt/pi-web-assets /root/.pi-web
+# /home/pi-agent is a workspace volume bind mount at runtime, so build-time
+# files in that path are shadowed. Copy them back from /opt.
+mkdir -p "$PI_HOME"
+if [ -d /opt/pi-web-assets ] && [ ! -d "$PI_HOME/.pi-web" ]; then
+    cp -a /opt/pi-web-assets "$PI_HOME/.pi-web"
+    chown -R pi-agent:pi-agent "$PI_HOME"
 fi
 
+# ── Workspace config ──
 mkdir -p /workspace/.agent
 cat > /workspace/.agent/config.json <<CONFIGEOF
 {
@@ -25,9 +31,11 @@ cat > /workspace/.agent/config.json <<CONFIGEOF
 }
 CONFIGEOF
 
-# Write pi gateway extension (pi extensions are JS modules, not JSON configs).
+# ── pi gateway extension (auto-loaded from ~/.pi/extensions/) ──
+# pi and pi-web sessiond both auto-load extensions from this directory.
 # Routes ALL models through the LLM gateway — handles local + remote transparently.
-cat > /root/pi-gateway-extension.js <<PIEXT
+mkdir -p "$PI_HOME/.pi/extensions"
+cat > "$PI_HOME/.pi/extensions/gateway.js" <<PIEXT
 export default function(pi) {
   pi.registerProvider("gateway", {
     name: "LLM Gateway",
@@ -45,25 +53,59 @@ export default function(pi) {
 }
 PIEXT
 
+# ── pi agent settings (global defaults for pi and pi-web sessiond) ──
+mkdir -p "$PI_HOME/.pi/agent"
+cat > "$PI_HOME/.pi/agent/settings.json" <<SETEOF
+{
+  "defaultProvider": "gateway",
+  "defaultModel": "${LLM_MODEL:-deepseek-v4-pro}",
+  "defaultThinkingLevel": "high"
+}
+SETEOF
+
+# ── pi-web config (sessiond + server state) ──
+mkdir -p "$PI_HOME/.config/pi-web"
+cat > "$PI_HOME/.config/pi-web/config.json" <<PWEBCFG
+{
+  "host": "0.0.0.0",
+  "port": 8504,
+  "spawnSessions": true
+}
+PWEBCFG
+
+# ── Ensure ownership ──
+chown -R pi-agent:pi-agent "$PI_HOME"
+
+# ── Also install extension for root (agent-runner tty exec uses root) ──
+mkdir -p /root/.pi/extensions /root/.pi/agent
+cp "$PI_HOME/.pi/extensions/gateway.js" /root/.pi/extensions/gateway.js
+cp "$PI_HOME/.pi/agent/settings.json" /root/.pi/agent/settings.json
+# Register the extension with pi's package registry (required for auto-discovery).
+# Must run AFTER cp because cp overwrites the packages field in settings.json;
+# pi install appends the package entry to the existing settings.
+HOME=/root pi install /root/.pi/extensions/gateway.js 2>/dev/null || true
+
 echo "═══════════════════════════════════════════"
 echo "  pi.dev agent session ${SESSION_ID}"
 echo "═══════════════════════════════════════════"
 echo "  Model:    ${LLM_MODEL}"
 echo "  Endpoint: ${LLM_ENDPOINT}"
+echo "  User:     pi-agent (sudo: passwordless)"
 echo "  Workspace: ${WORKSPACE}"
 echo ""
 echo "  pi is available in PATH."
-echo "  Run it manually:"
-echo "    pi --provider gateway --model ${LLM_MODEL} --api-key ${LLM_API_KEY} --extension /root/pi-gateway-extension.js"
+echo "  Gateway extension auto-loaded from:"
+echo "    ~/.pi/extensions/gateway.js"
 echo ""
 echo "═══════════════════════════════════════════"
 echo ""
 
-# ── Install pi packages (idempotent, runs on every container start) ──
-# /root is on tmpfs, so we register packages each time the container starts
-mkdir -p ~/.pi
-pi install npm:pi-memory-stone 2>/dev/null
-pi install npm:pi-observational-memory 2>/dev/null
+# Install extension for pi-agent user too (for pi-web sessiond)
+su - pi-agent -c "HOME=/home/pi-agent pi install /home/pi-agent/.pi/extensions/gateway.js 2>/dev/null" 2>/dev/null || true
+
+# ── Install pi packages (idempotent) ──
+su - pi-agent -c "pi install npm:pi-memory-stone 2>/dev/null" 2>/dev/null
+su - pi-agent -c "pi install npm:pi-observational-memory 2>/dev/null" 2>/dev/null
 
 echo "  Packages: pi-memory-stone + pi-observational-memory enabled"
 echo ""
@@ -72,5 +114,5 @@ if [ -f /workspace/.agentrc ]; then
   . /workspace/.agentrc
 fi
 
-# Keep container alive with interactive shell
-exec /bin/sh
+# ── Drop privileges: run as pi-agent ──
+exec su - pi-agent -c /bin/sh

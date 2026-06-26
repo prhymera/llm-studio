@@ -174,11 +174,11 @@ func (m *Manager) StartPiWeb(ctx context.Context, sessionID string) (*PiWebStatu
 	launchCmd := []string{"sh", "-c", fmt.Sprintf(
 		"if command -v pi-web-server >/dev/null 2>&1; then "+
 			"echo 'pi-web-server found in PATH, starting sessiond + server...'; "+
-			"mkdir -p /root/.pi-web; "+
-			"PI_WEB_CONFIG=/root/.pi-web/config.json PI_WEB_HOST=0.0.0.0 "+
+			"mkdir -p /home/pi-agent/.pi-web; "+
+			"PI_WEB_CONFIG=/home/pi-agent/.pi-web/config.json PI_WEB_HOST=0.0.0.0 "+
 			"nohup pi-web-sessiond > /tmp/piweb-sessiond.log 2>&1 & "+
 			"sleep 1; "+
-			"PI_WEB_CONFIG=/root/.pi-web/config.json PI_WEB_HOST=0.0.0.0 "+
+			"PI_WEB_CONFIG=/home/pi-agent/.pi-web/config.json PI_WEB_HOST=0.0.0.0 "+
 			"nohup pi-web-server --host 0.0.0.0 --port %d > /tmp/piweb-server.log 2>&1 & "+
 			"echo 'OK'; "+
 			"else "+
@@ -201,7 +201,9 @@ func (m *Manager) StartPiWeb(ctx context.Context, sessionID string) (*PiWebStatu
 		piWebDefaultPort, piWebDefaultPort),
 	}
 	execResp, execErr := m.cli.ContainerExecCreate(ctx, c.ID, container.ExecOptions{
+		User:         "1100",
 		Cmd:          launchCmd,
+		Env:          []string{"HOME=/home/pi-agent"},
 		AttachStdout: true,
 		AttachStderr: true,
 	})
