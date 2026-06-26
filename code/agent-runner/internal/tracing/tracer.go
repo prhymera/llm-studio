@@ -29,6 +29,7 @@ import (
 	"net/http"
 	"os"
 	"runtime"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -95,14 +96,17 @@ type ErrorReport struct {
 // ── Trace Buffer ───────────────────────────────────────────
 
 // traceBuffer is a simple in-memory buffer for the current goroutine's traces.
-// In production, consider using a ring buffer or channel-based batching.
+// Thread-safe via mutex.
 type traceBuffer struct {
+	mu     sync.Mutex
 	events []TraceEvent
 }
 
 var globalBuffer = &traceBuffer{}
 
 func (b *traceBuffer) push(event TraceEvent) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	b.events = append(b.events, event)
 	if len(b.events) > maxTraceBuffer {
 		excess := len(b.events) - maxTraceBuffer
@@ -111,6 +115,8 @@ func (b *traceBuffer) push(event TraceEvent) {
 }
 
 func (b *traceBuffer) drain() []TraceEvent {
+	b.mu.Lock()
+	defer b.mu.Unlock()
 	events := b.events
 	b.events = nil
 	return events
@@ -192,6 +198,9 @@ func TraceFnSimple(ctx context.Context, name string, fn func() error) error {
 
 // ReportError sends an error report to the resolution collector.
 func ReportError(report *ErrorReport) error {
+	if report == nil {
+		return fmt.Errorf("nil error report")
+	}
 	if report.Level == "" {
 		report.Level = "error"
 	}
