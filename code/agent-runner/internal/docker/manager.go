@@ -104,6 +104,13 @@ func (m *Manager) CreateSession(ctx context.Context, agentType, model, label str
 		return nil, fmt.Errorf("create workspace: %w", err)
 	}
 
+	// Persistent npm directories on workspace volume (avoids tmpfs size limits for pi-web.dev installs)
+	npmCacheDir := filepath.Join(workspacePath, ".npm")
+	npmGlobalDir := filepath.Join(workspacePath, ".npm-global")
+	os.MkdirAll(npmCacheDir, 0755)
+	os.MkdirAll(npmGlobalDir, 0755)
+	os.MkdirAll(filepath.Join(workspacePath, ".pi"), 0755)
+
 	imageName := fmt.Sprintf("llm-studio-agent-%s:latest", agentType)
 	containerName := fmt.Sprintf("agent-%s-%s", userID[:8], sessID[:12])
 
@@ -135,6 +142,8 @@ func (m *Manager) CreateSession(ctx context.Context, agentType, model, label str
 	}, &container.HostConfig{
 		Binds: []string{
 			fmt.Sprintf("%s:/workspace:rw", workspacePath),
+			fmt.Sprintf("%s:/root/.npm:rw", npmCacheDir),
+			fmt.Sprintf("%s:/root/.npm-global:rw", npmGlobalDir),
 		},
 		Resources: container.Resources{
 			Memory:   parseMemoryBytes(m.cfg.MemoryLimit),
@@ -142,8 +151,8 @@ func (m *Manager) CreateSession(ctx context.Context, agentType, model, label str
 		},
 		ReadonlyRootfs: true,
 		Tmpfs: map[string]string{
-			"/tmp":  "rw,noexec,nosuid,size=64m",
-			"/root": "rw,noexec,nosuid,size=4m",
+			"/tmp":  "rw,noexec,nosuid,size=256m",
+			"/root": "rw,noexec,nosuid,size=256m",
 		},
 		NetworkMode:  container.NetworkMode(m.effectiveNetwork()),
 	}, nil, nil, containerName)

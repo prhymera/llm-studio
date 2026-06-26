@@ -186,9 +186,24 @@ func (m *Manager) StartPiWeb(ctx context.Context, sessionID string) (*PiWebStatu
 		return nil, fmt.Errorf("find available port: %w", err)
 	}
 
-	// Launch pi-web.dev inside the container on the default port
+	// pi-web.dev requires Node >= 22; current pi agent image has Node 20.
+	// TODO: upgrade llm-studio-agent-pi image to Node 22, then re-enable.
+	installCmd := []string{"sh", "-c", fmt.Sprintf(
+		"NODE_VERSION=$(node -v 2>/dev/null | sed 's/v//' | cut -d. -f1) && "+
+			"if [ \"$NODE_VERSION\" -lt 22 ]; then "+
+			"echo 'pi-web.dev requires Node >= 22 but found v'$NODE_VERSION'. Skipping.' && "+
+			"echo 'UPGRADE_NEEDED:NODE_VERSION'; "+
+			"else "+
+			"PIWEB_DIR=/root/pi-web && mkdir -p $PIWEB_DIR && "+
+			"echo 'Installing pi-web.dev...' && "+
+			"cd $PIWEB_DIR && npm install @jmfederico/pi-web --omit=dev 2>&1 && "+
+			"echo 'Starting pi-web-server on port %d...' && "+
+			"nohup $PIWEB_DIR/node_modules/.bin/pi-web-server --port %d > /tmp/piweb.log 2>&1 & "+
+			"echo \"pi-web started on port %d\"; fi",
+		piWebDefaultPort, piWebDefaultPort, piWebDefaultPort),
+	}
 	execResp, execErr := m.cli.ContainerExecCreate(ctx, c.ID, container.ExecOptions{
-		Cmd:          []string{"sh", "-c", fmt.Sprintf("nohup pi-web-server --port %d > /tmp/piweb.log 2>&1 & echo \"pi-web started on port %d\"", piWebDefaultPort, piWebDefaultPort)},
+		Cmd:          installCmd,
 		AttachStdout: true,
 		AttachStderr: true,
 	})
@@ -202,7 +217,7 @@ func (m *Manager) StartPiWeb(ctx context.Context, sessionID string) (*PiWebStatu
 	}
 	defer execAttach.Close()
 
-	buf := make([]byte, 256)
+	buf := make([]byte, 1024)
 	n, _ := execAttach.Reader.Read(buf)
 	log.Printf("pi-web.dev launch output: %s", strings.TrimSpace(string(buf[:n])))
 
