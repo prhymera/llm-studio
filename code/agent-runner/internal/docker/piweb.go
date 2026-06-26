@@ -128,10 +128,15 @@ func (m *Manager) StartPiWeb(ctx context.Context, sessionID string) (*PiWebStatu
 		return nil, fmt.Errorf("container is not running (state: %s)", c.State)
 	}
 
-	// Assign a dynamic port
-	port, err := findAvailablePort()
-	if err != nil {
-		return nil, fmt.Errorf("find available port: %w", err)
+	// Use the pre-published pi-web.dev port from container env (set at creation)
+	port := piWebDefaultPort
+	insp, inspErr := m.cli.ContainerInspect(ctx, c.ID)
+	if inspErr == nil && insp.Config != nil {
+		for _, env := range insp.Config.Env {
+			if strings.HasPrefix(env, "PI_WEB_PORT=") {
+				fmt.Sscanf(strings.TrimPrefix(env, "PI_WEB_PORT="), "%d", &port)
+			}
+		}
 	}
 
 	// Launch pi-web.dev inside the container
@@ -223,4 +228,16 @@ func findAvailablePort() (int, error) {
 	}
 	defer listener.Close()
 	return listener.Addr().(*net.TCPAddr).Port, nil
+}
+
+// findAvailablePiWebPort finds an available port in the pi-web.dev range (44000-44999).
+func findAvailablePiWebPort() (int, error) {
+	for port := 44000; port <= 44999; port++ {
+		listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+		if err == nil {
+			listener.Close()
+			return port, nil
+		}
+	}
+	return 0, fmt.Errorf("no available ports in range 44000-44999")
 }

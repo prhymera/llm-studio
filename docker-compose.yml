@@ -86,6 +86,8 @@ services:
       AGENT_CPU_LIMIT: "${AGENT_CPU_LIMIT:-4}"
       AGENT_MEMORY_LIMIT: "${AGENT_MEMORY_LIMIT:-4G}"
       DOCKER_NETWORK: "${DOCKER_NETWORK:-llm-studio_llm-studio-network}"
+      BIND_IP: "${BIND_IP:-10.128.0.5}"
+      RESOLUTION_COLLECTOR_URL: "${RESOLUTION_COLLECTOR_URL:-http://resolution-collector:9090}"
     volumes:
       # Docker socket for spawning agent containers
       - /var/run/docker.sock:/var/run/docker.sock:rw
