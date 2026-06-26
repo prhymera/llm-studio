@@ -292,7 +292,11 @@ func (s *Server) proxyToLocal(w http.ResponseWriter, r *http.Request, req *struc
 	}
 	proxyReq.Header = r.Header.Clone()
 
-	client := &http.Client{Timeout: 300 * time.Second}
+	// Set response header timeout; stream body timeout is handled by context
+	client := &http.Client{
+		Timeout:   300 * time.Second,
+		Transport: &http.Transport{ResponseHeaderTimeout: 60 * time.Second},
+	}
 	resp, err := client.Do(proxyReq)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{
@@ -302,16 +306,21 @@ func (s *Server) proxyToLocal(w http.ResponseWriter, r *http.Request, req *struc
 	}
 	defer resp.Body.Close()
 
-	// Stream the response back
+	// Stream the response back with flushing for SSE
 	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(resp.StatusCode)
 
+	flusher, canFlush := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				break
+			}
+			if canFlush {
+				flusher.Flush()
 			}
 		}
 		if err != nil {
@@ -353,7 +362,11 @@ func (s *Server) proxyToRemote(w http.ResponseWriter, r *http.Request, req *stru
 	proxyReq.Header = r.Header.Clone()
 	proxyReq.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiKey))
 
-	client := &http.Client{Timeout: 300 * time.Second}
+	// Use streaming-friendly client with response header timeout
+	client := &http.Client{
+		Timeout:   300 * time.Second,
+		Transport: &http.Transport{ResponseHeaderTimeout: 30 * time.Second},
+	}
 	resp, err := client.Do(proxyReq)
 	if err != nil {
 		writeJSON(w, http.StatusBadGateway, map[string]string{
@@ -363,15 +376,21 @@ func (s *Server) proxyToRemote(w http.ResponseWriter, r *http.Request, req *stru
 	}
 	defer resp.Body.Close()
 
+	// Stream response with flushing for SSE
 	w.Header().Set("Content-Type", resp.Header.Get("Content-Type"))
+	w.Header().Set("X-Accel-Buffering", "no")
 	w.WriteHeader(resp.StatusCode)
 
+	flusher, canFlush := w.(http.Flusher)
 	buf := make([]byte, 32*1024)
 	for {
 		n, err := resp.Body.Read(buf)
 		if n > 0 {
 			if _, werr := w.Write(buf[:n]); werr != nil {
 				break
+			}
+			if canFlush {
+				flusher.Flush()
 			}
 		}
 		if err != nil {

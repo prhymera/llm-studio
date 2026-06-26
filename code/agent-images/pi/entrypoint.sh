@@ -47,6 +47,15 @@ echo ""
 echo "═══════════════════════════════════════════"
 echo ""
 
+# ── Install pi packages (idempotent, runs on every container start) ──
+# /root is on tmpfs, so we register packages each time the container starts
+mkdir -p ~/.pi
+pi install npm:pi-memory-stone 2>/dev/null
+pi install npm:pi-observational-memory 2>/dev/null
+
+echo "  Packages: pi-memory-stone + pi-observational-memory enabled"
+echo ""
+
 if [ -f /workspace/.agentrc ]; then
   . /workspace/.agentrc
 fi

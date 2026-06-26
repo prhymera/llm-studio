@@ -3,7 +3,7 @@
 # opencode agent entrypoint
 # Configures the environment and drops into an interactive shell.
 # ─────────────────────────────────────────────────────────────
-set -euo pipefail
+set +eu
 
 mkdir -p /workspace/.agent
 cat > /workspace/.agent/config.json <<CONFIGEOF

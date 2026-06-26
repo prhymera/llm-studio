@@ -10,11 +10,13 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"net/http/httputil"
 	"net/url"
@@ -367,6 +369,16 @@ func (c *cookieInjector) Write(data []byte) (int, error) {
 		c.cookieSet = true
 	}
 	return c.ResponseWriter.Write(data)
+}
+
+// Hijack implements http.Hijacker so WebSocket connections work through the proxy.
+// Delegates to the underlying ResponseWriter if it supports hijacking.
+func (c *cookieInjector) Hijack() (net.Conn, *bufio.ReadWriter, error) {
+	hijacker, ok := c.ResponseWriter.(http.Hijacker)
+	if !ok {
+		return nil, nil, fmt.Errorf("cookieInjector: underlying ResponseWriter does not implement http.Hijacker")
+	}
+	return hijacker.Hijack()
 }
 
 

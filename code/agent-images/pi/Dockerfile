@@ -5,8 +5,12 @@
 
 FROM node:20-alpine
 
-RUN npm install -g @anthropic-ai/pi 2>/dev/null || \
-    echo "Warning: pi package not available, install manually"
+# Install pi.dev CLI
+RUN npm install -g --ignore-scripts @mariozechner/pi-coding-agent
+
+# Install pi packages (memory-stone, observational-memory)
+# These install into /usr/local/lib/node_modules/ (shared, not in tmpfs)
+RUN npm install -g pi-memory-stone pi-observational-memory
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh

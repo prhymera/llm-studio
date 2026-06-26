@@ -3,10 +3,10 @@
 # Ephemeral container for open-source coding agent sessions
 # ─────────────────────────────────────────────────────────────
 
-FROM python:3.12-slim
+FROM node:20-alpine
 
-RUN pip install opencode 2>/dev/null || \
-    echo "Warning: opencode not available, install manually"
+RUN apk add --no-cache bash && \
+    npm install -g opencode-ai
 
 COPY entrypoint.sh /entrypoint.sh
 RUN chmod +x /entrypoint.sh
