@@ -83,28 +83,10 @@ func (m *Manager) GetPiWebStatus(ctx context.Context, sessionID string) (*PiWebS
 		return status, nil
 	}
 
-	// Check if pi-web.dev process is running inside container
+	// Check if pi-web.dev process is responding inside container
 	if c.State == "running" {
-		healthPort := piWebDefaultPort
-		if status.Port != 0 {
-			healthPort = status.Port
-		}
-		execResp, execErr := m.cli.ContainerExecCreate(ctx, c.ID, container.ExecOptions{
-			Cmd:          []string{"sh", "-c", fmt.Sprintf("wget -qO- http://127.0.0.1:%d/api/health 2>/dev/null || echo FAIL", healthPort)},
-			AttachStdout: true,
-			AttachStderr: true,
-		})
-		if execErr == nil {
-			execAttach, attachErr := m.cli.ContainerExecAttach(ctx, execResp.ID, container.ExecAttachOptions{})
-			if attachErr == nil {
-				defer execAttach.Close()
-				buf := make([]byte, 1024)
-				n, _ := execAttach.Reader.Read(buf)
-				output := string(buf[:n])
-				if !strings.Contains(output, "FAIL") && strings.Contains(strings.ToLower(output), "ok") {
-					status.Running = true
-				}
-			}
+		if err := checkPiWebHealth(ctx, m, c.ID); err == nil {
+			status.Running = true
 		}
 	}
 
@@ -186,24 +168,29 @@ func (m *Manager) StartPiWeb(ctx context.Context, sessionID string) (*PiWebStatu
 		return nil, fmt.Errorf("find available port: %w", err)
 	}
 
-	// pi-web.dev requires Node >= 22; current pi agent image has Node 20.
-	// TODO: upgrade llm-studio-agent-pi image to Node 22, then re-enable.
-	installCmd := []string{"sh", "-c", fmt.Sprintf(
-		"NODE_VERSION=$(node -v 2>/dev/null | sed 's/v//' | cut -d. -f1) && "+
+	// Launch pi-web.dev: pre-installed in the Docker image (Node >=22).
+	// Falls back to npm install if pi-web-server not found (legacy images).
+	launchCmd := []string{"sh", "-c", fmt.Sprintf(
+		"if command -v pi-web-server >/dev/null 2>&1; then "+
+			"echo 'pi-web-server found in PATH, starting...'; "+
+			"PI_WEB_HOST=0.0.0.0 nohup pi-web-server --host 0.0.0.0 --port %d > /tmp/piweb.log 2>&1 & "+
+			"echo 'OK'; "+
+			"else "+
+			"echo 'pi-web-server not found, attempting npm install...'; "+
+			"NODE_VERSION=$(node -v 2>/dev/null | sed 's/v//' | cut -d. -f1); "+
 			"if [ \"$NODE_VERSION\" -lt 22 ]; then "+
-			"echo 'pi-web.dev requires Node >= 22 but found v'$NODE_VERSION'. Skipping.' && "+
 			"echo 'UPGRADE_NEEDED:NODE_VERSION'; "+
 			"else "+
 			"PIWEB_DIR=/root/pi-web && mkdir -p $PIWEB_DIR && "+
-			"echo 'Installing pi-web.dev...' && "+
 			"cd $PIWEB_DIR && npm install @jmfederico/pi-web --omit=dev 2>&1 && "+
-			"echo 'Starting pi-web-server on port %d...' && "+
-			"nohup $PIWEB_DIR/node_modules/.bin/pi-web-server --port %d > /tmp/piweb.log 2>&1 & "+
-			"echo \"pi-web started on port %d\"; fi",
-		piWebDefaultPort, piWebDefaultPort, piWebDefaultPort),
+			"PI_WEB_HOST=0.0.0.0 nohup $PIWEB_DIR/node_modules/.bin/pi-web-server --host 0.0.0.0 --port %d > /tmp/piweb.log 2>&1 & "+
+			"echo 'OK'; "+
+			"fi; "+
+			"fi",
+		piWebDefaultPort, piWebDefaultPort),
 	}
 	execResp, execErr := m.cli.ContainerExecCreate(ctx, c.ID, container.ExecOptions{
-		Cmd:          installCmd,
+		Cmd:          launchCmd,
 		AttachStdout: true,
 		AttachStderr: true,
 	})
@@ -219,7 +206,17 @@ func (m *Manager) StartPiWeb(ctx context.Context, sessionID string) (*PiWebStatu
 
 	buf := make([]byte, 1024)
 	n, _ := execAttach.Reader.Read(buf)
-	log.Printf("pi-web.dev launch output: %s", strings.TrimSpace(string(buf[:n])))
+	output := strings.TrimSpace(string(buf[:n]))
+	log.Printf("pi-web.dev launch output: %s", output)
+
+	// If Node version too old, return upgrade-needed error
+	if strings.Contains(output, "UPGRADE_NEEDED:NODE_VERSION") {
+		return &PiWebStatus{
+			Enabled: false,
+			Message: "pi-web.dev requires Node >= 22 — upgrade the agent image",
+			BindIP:  detectBindIP(),
+		}, nil
+	}
 
 	// Wait for pi-web.dev to be ready inside the container
 	ready := false
@@ -327,9 +324,11 @@ func runPiWebProxy(proxy *piWebProxy, targetAddr string) {
 }
 
 // checkPiWebHealth verifies pi-web.dev is responding inside the container.
+// pi-web.dev is a SPA — all routes return index.html, so we just check for
+// a successful HTTP response (non-empty body, no wget errors).
 func checkPiWebHealth(ctx context.Context, m *Manager, containerID string) error {
 	execResp, err := m.cli.ContainerExecCreate(ctx, containerID, container.ExecOptions{
-		Cmd:          []string{"sh", "-c", fmt.Sprintf("wget -qO- http://127.0.0.1:%d/api/health 2>/dev/null || echo FAIL", piWebDefaultPort)},
+		Cmd:          []string{"sh", "-c", fmt.Sprintf("wget -qO- --timeout=2 http://127.0.0.1:%d/ 2>&1", piWebDefaultPort)},
 		AttachStdout: true,
 	})
 	if err != nil {
@@ -342,8 +341,10 @@ func checkPiWebHealth(ctx context.Context, m *Manager, containerID string) error
 	defer execAttach.Close()
 	buf := make([]byte, 512)
 	n, _ := execAttach.Reader.Read(buf)
-	if strings.Contains(string(buf[:n]), "FAIL") {
-		return fmt.Errorf("health check failed")
+	output := string(buf[:n])
+	// Server responds with HTML (SPA fallback); failure means connection refused or empty
+	if strings.Contains(output, "Connection refused") || strings.Contains(output, "wget: ") || len(strings.TrimSpace(output)) == 0 {
+		return fmt.Errorf("health check failed: %s", strings.TrimSpace(output))
 	}
 	return nil
 }

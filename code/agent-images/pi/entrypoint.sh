@@ -6,6 +6,13 @@
 set +e
 export HOME=/root
 
+# ── Restore pi-web.dev assets from image layer ──
+# /root is a workspace volume bind mount at runtime, so build-time files
+# in /root/.pi-web are shadowed.  Copy them back from the image stash.
+if [ -d /opt/pi-web-assets ] && [ ! -d /root/.pi-web ]; then
+    cp -a /opt/pi-web-assets /root/.pi-web
+fi
+
 mkdir -p /workspace/.agent
 cat > /workspace/.agent/config.json <<CONFIGEOF
 {
