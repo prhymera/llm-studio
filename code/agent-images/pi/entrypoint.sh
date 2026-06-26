@@ -76,15 +76,6 @@ PWEBCFG
 # ── Ensure ownership ──
 chown -R pi-agent:pi-agent "$PI_HOME"
 
-# ── Also install extension for root (agent-runner tty exec uses root) ──
-mkdir -p /root/.pi/extensions /root/.pi/agent
-cp "$PI_HOME/.pi/extensions/gateway.js" /root/.pi/extensions/gateway.js
-cp "$PI_HOME/.pi/agent/settings.json" /root/.pi/agent/settings.json
-# Register the extension with pi's package registry (required for auto-discovery).
-# Must run AFTER cp because cp overwrites the packages field in settings.json;
-# pi install appends the package entry to the existing settings.
-HOME=/root pi install /root/.pi/extensions/gateway.js 2>/dev/null || true
-
 echo "═══════════════════════════════════════════"
 echo "  pi.dev agent session ${SESSION_ID}"
 echo "═══════════════════════════════════════════"
@@ -100,7 +91,7 @@ echo ""
 echo "═══════════════════════════════════════════"
 echo ""
 
-# Install extension for pi-agent user too (for pi-web sessiond)
+# ── Install extension for pi-agent (for pi-web sessiond auto-discovery) ──
 su - pi-agent -c "HOME=/home/pi-agent pi install /home/pi-agent/.pi/extensions/gateway.js 2>/dev/null" 2>/dev/null || true
 
 # ── Install pi packages (idempotent) ──
