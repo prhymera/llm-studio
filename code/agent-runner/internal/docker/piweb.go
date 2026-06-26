@@ -168,12 +168,18 @@ func (m *Manager) StartPiWeb(ctx context.Context, sessionID string) (*PiWebStatu
 		return nil, fmt.Errorf("find available port: %w", err)
 	}
 
-	// Launch pi-web.dev: pre-installed in the Docker image (Node >=22).
+	// Launch pi-web.dev: sessiond first (Unix socket), then server (HTTP).
+	// Both are pre-installed in the Docker image (Node >=22).
 	// Falls back to npm install if pi-web-server not found (legacy images).
 	launchCmd := []string{"sh", "-c", fmt.Sprintf(
 		"if command -v pi-web-server >/dev/null 2>&1; then "+
-			"echo 'pi-web-server found in PATH, starting...'; "+
-			"PI_WEB_HOST=0.0.0.0 nohup pi-web-server --host 0.0.0.0 --port %d > /tmp/piweb.log 2>&1 & "+
+			"echo 'pi-web-server found in PATH, starting sessiond + server...'; "+
+			"mkdir -p /root/.pi-web; "+
+			"PI_WEB_CONFIG=/root/.pi-web/config.json PI_WEB_HOST=0.0.0.0 "+
+			"nohup pi-web-sessiond > /tmp/piweb-sessiond.log 2>&1 & "+
+			"sleep 1; "+
+			"PI_WEB_CONFIG=/root/.pi-web/config.json PI_WEB_HOST=0.0.0.0 "+
+			"nohup pi-web-server --host 0.0.0.0 --port %d > /tmp/piweb-server.log 2>&1 & "+
 			"echo 'OK'; "+
 			"else "+
 			"echo 'pi-web-server not found, attempting npm install...'; "+
@@ -183,7 +189,12 @@ func (m *Manager) StartPiWeb(ctx context.Context, sessionID string) (*PiWebStatu
 			"else "+
 			"PIWEB_DIR=/root/pi-web && mkdir -p $PIWEB_DIR && "+
 			"cd $PIWEB_DIR && npm install @jmfederico/pi-web --omit=dev 2>&1 && "+
-			"PI_WEB_HOST=0.0.0.0 nohup $PIWEB_DIR/node_modules/.bin/pi-web-server --host 0.0.0.0 --port %d > /tmp/piweb.log 2>&1 & "+
+			"mkdir -p /root/.pi-web && "+
+			"PI_WEB_CONFIG=/root/.pi-web/config.json PI_WEB_HOST=0.0.0.0 "+
+			"nohup $PIWEB_DIR/node_modules/.bin/pi-web-sessiond > /tmp/piweb-sessiond.log 2>&1 & "+
+			"sleep 1; "+
+			"PI_WEB_CONFIG=/root/.pi-web/config.json PI_WEB_HOST=0.0.0.0 "+
+			"nohup $PIWEB_DIR/node_modules/.bin/pi-web-server --host 0.0.0.0 --port %d > /tmp/piweb-server.log 2>&1 & "+
 			"echo 'OK'; "+
 			"fi; "+
 			"fi",
