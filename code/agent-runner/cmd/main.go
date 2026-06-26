@@ -185,6 +185,7 @@ func main() {
 	go func() {
 		<-sigCh
 		log.Println("Shutting down...")
+		docker.StopAllPiWebProxies()
 		dockerManager.CleanupAll(ctx)
 		cancel()
 		os.Exit(0)
