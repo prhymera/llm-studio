@@ -291,6 +291,7 @@ func (s *Server) proxyToLocal(w http.ResponseWriter, r *http.Request, req *struc
 		return
 	}
 	proxyReq.Header = r.Header.Clone()
+	proxyReq.Header.Del("Accept-Encoding")
 
 	// Set response header timeout; stream body timeout is handled by context
 	client := &http.Client{
@@ -361,6 +362,10 @@ func (s *Server) proxyToRemote(w http.ResponseWriter, r *http.Request, req *stru
 
 	proxyReq.Header = r.Header.Clone()
 	proxyReq.Header.Set("Authorization", fmt.Sprintf("Bearer %s", apiKey))
+	// Strip Accept-Encoding so Go's transport handles gzip decompression.
+	// When Accept-Encoding is already set, the transport skips auto-decompression
+	// and the raw gzip bytes from the upstream would corrupt picoclaw's JSON parser.
+	proxyReq.Header.Del("Accept-Encoding")
 
 	// Use streaming-friendly client with response header timeout
 	client := &http.Client{

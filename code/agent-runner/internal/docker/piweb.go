@@ -119,7 +119,7 @@ func (m *Manager) GetPiWebStatus(ctx context.Context, sessionID string) (*PiWebS
 }
 
 // StartPiWeb launches pi-web.dev inside the container and creates a TCP proxy
-// on the agent-runner's VPN IP to forward traffic to the container.
+// listening on 0.0.0.0 (Docker port publishing handles external IP binding).
 func (m *Manager) StartPiWeb(ctx context.Context, sessionID string) (*PiWebStatus, error) {
 	containers, err := m.cli.ContainerList(ctx, container.ListOptions{
 		All: true,
@@ -180,11 +180,10 @@ func (m *Manager) StartPiWeb(ctx context.Context, sessionID string) (*PiWebStatu
 	}
 	piWebProxyRegistryMu.Unlock()
 
-	// Find an available port on the BIND_IP
-	bindIP := detectBindIP()
-	hostPort, err := findAvailablePortOnIP(bindIP)
+	// Find an available port (bind to 0.0.0.0 internally; Docker maps to host IP)
+	hostPort, err := findAvailablePortInRange()
 	if err != nil {
-		return nil, fmt.Errorf("find available port on %s: %w", bindIP, err)
+		return nil, fmt.Errorf("find available port: %w", err)
 	}
 
 	// Launch pi-web.dev inside the container on the default port
@@ -222,16 +221,18 @@ func (m *Manager) StartPiWeb(ctx context.Context, sessionID string) (*PiWebStatu
 			Enabled: true,
 			Running: false,
 			Port:    hostPort,
-			BindIP:  bindIP,
+			BindIP:  detectBindIP(),
+			URL:     fmt.Sprintf("http://%s:%d", detectBindIP(), hostPort),
 			Message: "pi-web.dev was launched but not yet ready — try again in a moment",
 		}, nil
 	}
 
-	// Start TCP proxy: bind_ip:hostPort -> container_ip:piWebDefaultPort
+	// Start TCP proxy: 0.0.0.0:hostPort -> container_ip:piWebDefaultPort
+	// Docker port publishing maps 0.0.0.0 to the host's VPN IP.
 	targetAddr := fmt.Sprintf("%s:%d", containerIP, piWebDefaultPort)
-	listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", bindIP, hostPort))
+	listener, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", hostPort))
 	if err != nil {
-		return nil, fmt.Errorf("start proxy listener on %s:%d: %w", bindIP, hostPort, err)
+		return nil, fmt.Errorf("start proxy listener on 0.0.0.0:%d: %w", hostPort, err)
 	}
 
 	proxy := &piWebProxy{
@@ -246,14 +247,14 @@ func (m *Manager) StartPiWeb(ctx context.Context, sessionID string) (*PiWebStatu
 	piWebProxyRegistry[proxy.sessionID] = proxy
 	piWebProxyRegistryMu.Unlock()
 
-	log.Printf("pi-web.dev proxy started: %s:%d → %s", bindIP, hostPort, targetAddr)
+	log.Printf("pi-web.dev proxy started: %s:%d → %s", detectBindIP(), hostPort, targetAddr)
 
 	return &PiWebStatus{
 		Enabled: true,
 		Running: true,
-		URL:     fmt.Sprintf("http://%s:%d", bindIP, hostPort),
+		URL:     fmt.Sprintf("http://%s:%d", detectBindIP(), hostPort),
 		Port:    hostPort,
-		BindIP:  bindIP,
+		BindIP:  detectBindIP(),
 		Message: "pi-web.dev is running",
 	}, nil
 }
@@ -351,16 +352,17 @@ func detectBindIP() string {
 	return "127.0.0.1"
 }
 
-// findAvailablePortOnIP finds an available TCP port on a specific IP in the pi-web.dev range.
-func findAvailablePortOnIP(bindIP string) (int, error) {
-	for port := 44000; port <= 44999; port++ {
-		listener, err := net.Listen("tcp", fmt.Sprintf("%s:%d", bindIP, port))
+// findAvailablePortInRange finds an available TCP port in the pi-web.dev range (44000-44009).
+// Binds to 0.0.0.0 internally; Docker port publishing handles external IP restriction.
+func findAvailablePortInRange() (int, error) {
+	for port := 44000; port <= 44009; port++ {
+		listener, err := net.Listen("tcp", fmt.Sprintf("0.0.0.0:%d", port))
 		if err == nil {
 			listener.Close()
 			return port, nil
 		}
 	}
-	return 0, fmt.Errorf("no available ports in range 44000-44999 on %s", bindIP)
+	return 0, fmt.Errorf("no available ports in range 44000-44009")
 }
 
 // isClosedNetworkErr returns true if the error indicates the listener was closed.
