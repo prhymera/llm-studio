@@ -32,6 +32,7 @@ type Config struct {
 	CPULimit       int
 	MemoryLimit    string
 	DockerNetwork  string
+	FraoSkillsPath string // path on host containing frao-skills (mounted ro into agents)
 }
 
 // Manager handles Docker container lifecycle for agent sessions.
@@ -104,12 +105,18 @@ func (m *Manager) CreateSession(ctx context.Context, agentType, model, label str
 		return nil, fmt.Errorf("create workspace: %w", err)
 	}
 
-	// Persistent npm directories on workspace volume (avoids tmpfs size limits for pi-web.dev installs)
-	npmCacheDir := filepath.Join(workspacePath, ".npm")
-	npmGlobalDir := filepath.Join(workspacePath, ".npm-global")
+	// Persistent home directories on workspace volume (disk, not tmpfs/RAM).
+	// tmpfs for /root was doubly wasteful: RAM for storage + RAM for runtime.
+	rootDir := filepath.Join(workspacePath, "home")
+	npmCacheDir := filepath.Join(rootDir, ".npm")
+	npmGlobalDir := filepath.Join(rootDir, ".npm-global")
+	os.MkdirAll(rootDir, 0755)
 	os.MkdirAll(npmCacheDir, 0755)
 	os.MkdirAll(npmGlobalDir, 0755)
-	os.MkdirAll(filepath.Join(workspacePath, ".pi"), 0755)
+	os.MkdirAll(filepath.Join(rootDir, ".pi", "skills"), 0755)
+	// Create symlinks so pi can find frao-skills as ~/.pi/skills/<skill>
+	// (container /root is bind-mounted from rootDir which has the .pi/skills dir ready)
+	os.MkdirAll(filepath.Join(rootDir, ".config"), 0755)
 
 	imageName := fmt.Sprintf("llm-studio-agent-%s:latest", agentType)
 	containerName := fmt.Sprintf("agent-%s-%s", userID[:8], sessID[:12])
@@ -142,8 +149,8 @@ func (m *Manager) CreateSession(ctx context.Context, agentType, model, label str
 	}, &container.HostConfig{
 		Binds: []string{
 			fmt.Sprintf("%s:/workspace:rw", workspacePath),
-			fmt.Sprintf("%s:/root/.npm:rw", npmCacheDir),
-			fmt.Sprintf("%s:/root/.npm-global:rw", npmGlobalDir),
+			fmt.Sprintf("%s:/root:rw", rootDir),
+			fmt.Sprintf("%s:/frao-skills:ro", m.cfg.FraoSkillsPath),
 		},
 		Resources: container.Resources{
 			Memory:   parseMemoryBytes(m.cfg.MemoryLimit),
@@ -151,8 +158,7 @@ func (m *Manager) CreateSession(ctx context.Context, agentType, model, label str
 		},
 		ReadonlyRootfs: true,
 		Tmpfs: map[string]string{
-			"/tmp":  "rw,noexec,nosuid,size=256m",
-			"/root": "rw,noexec,nosuid,size=256m",
+			"/tmp": "rw,noexec,nosuid,size=64m",
 		},
 		NetworkMode:  container.NetworkMode(m.effectiveNetwork()),
 	}, nil, nil, containerName)
@@ -294,6 +300,10 @@ func (m *Manager) AttachTerminal(w http.ResponseWriter, r *http.Request, session
 		agentCmd = []string{"picoclaw", "agent", "--model", model}
 	case "pi":
 		agentCmd = []string{"pi", "--model", model, "--api-key", "local"}
+		// Preload frao-skills if available ("/frao-skills" mounted from host)
+		for _, skill := range m.discoverFraoSkills() {
+			agentCmd = append(agentCmd, "--skill", filepath.Join("/frao-skills", skill))
+		}
 	case "opencode":
 		agentCmd = []string{"opencode", "--model", model}
 	default:
@@ -482,4 +492,23 @@ func mapContainerToSession(c container.Summary) *session.Session {
 		ContainerID: c.ID,
 		Status:      c.State,
 	}
+}
+
+// discoverFraoSkills returns the directory names of frao-skills available on the host.
+// These are mounted into agent containers at /frao-skills/<name>.
+func (m *Manager) discoverFraoSkills() []string {
+	if m.cfg.FraoSkillsPath == "" {
+		return nil
+	}
+	entries, err := os.ReadDir(m.cfg.FraoSkillsPath)
+	if err != nil {
+		return nil
+	}
+	var skills []string
+	for _, e := range entries {
+		if e.IsDir() {
+			skills = append(skills, e.Name())
+		}
+	}
+	return skills
 }

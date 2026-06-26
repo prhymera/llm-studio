@@ -51,6 +51,7 @@ type Config struct {
 	AgentCPULimit    int
 	AgentMemoryLimit string
 	DockerNetwork    string
+	FraoSkillsPath   string
 }
 
 func loadConfig() Config {
@@ -64,6 +65,7 @@ func loadConfig() Config {
 		AgentCPULimit:    envInt("AGENT_CPU_LIMIT", 4),
 		AgentMemoryLimit: envOrDefault("AGENT_MEMORY_LIMIT", "4G"),
 		DockerNetwork:    envOrDefault("DOCKER_NETWORK", "llm-studio_llm-studio-network"),
+		FraoSkillsPath:   envOrDefault("FRAO_SKILLS_PATH", "/home/rprimera/prhyme/projects/frao-skills/skills"),
 	}
 }
 
@@ -109,6 +111,7 @@ func main() {
 		CPULimit:       cfg.AgentCPULimit,
 		MemoryLimit:    cfg.AgentMemoryLimit,
 		DockerNetwork:  cfg.DockerNetwork,
+		FraoSkillsPath: cfg.FraoSkillsPath,
 	})
 	if err != nil {
 		log.Fatalf("Failed to initialize Docker manager: %v", err)
