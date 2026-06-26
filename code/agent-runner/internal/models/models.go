@@ -108,14 +108,22 @@ func fetchLocalModels(gatewayURL string) ([]ModelInfo, error) {
 
 	localModels := make([]ModelInfo, 0, len(gatewayResp.Data))
 	for _, m := range gatewayResp.Data {
+		// Skip models already listed in RemoteModels (avoid duplicates)
+		if isInRemoteModels(m.ID) {
+			continue
+		}
 		name := m.Name
 		if name == "" {
 			name = m.ID
 		}
+		category := "local"
+		if m.OwnedBy == "remote" {
+			category = "remote"
+		}
 		localModels = append(localModels, ModelInfo{
 			ID:       m.ID,
 			Name:     name,
-			Category: "local",
+			Category: category,
 			Provider: m.OwnedBy,
 			Context:  32768,
 			Ready:    true,
@@ -123,4 +131,14 @@ func fetchLocalModels(gatewayURL string) ([]ModelInfo, error) {
 	}
 
 	return localModels, nil
+}
+
+// isInRemoteModels checks if a model ID is in the hardcoded RemoteModels list.
+func isInRemoteModels(id string) bool {
+	for _, m := range RemoteModels {
+		if m.ID == id {
+			return true
+		}
+	}
+	return false
 }

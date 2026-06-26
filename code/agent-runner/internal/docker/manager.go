@@ -300,7 +300,10 @@ func (m *Manager) AttachTerminal(w http.ResponseWriter, r *http.Request, session
 	case "picoclaw":
 		agentCmd = []string{"picoclaw", "agent", "--model", model}
 	case "pi":
-		agentCmd = []string{"pi", "--model", model, "--api-key", "local"}
+		// --provider gateway routes ALL models through the LLM gateway
+		// (custom provider defined in /etc/pi-gateway-extension.js)
+		agentCmd = []string{"pi", "--provider", "gateway", "--model", model, "--api-key", "local",
+			"--extension", "/root/pi-gateway-extension.js"}
 		// Preload frao-skills if available ("/frao-skills" mounted from host)
 		for _, skill := range m.discoverFraoSkills() {
 			agentCmd = append(agentCmd, "--skill", filepath.Join("/frao-skills", skill))

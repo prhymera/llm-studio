@@ -25,20 +25,25 @@ cat > /workspace/.agent/config.json <<CONFIGEOF
 }
 CONFIGEOF
 
-# Write pi config to workspace (rootfs may be read-only)
-cat > /workspace/.agent/pi-config.json <<PICONFIG
-{
-  "models": {
-    "default": "${LLM_MODEL:-qwen25-coder-7b}",
-    "providers": {
-      "openai": {
-        "api_key": "${LLM_API_KEY:-local}",
-        "base_url": "${LLM_ENDPOINT:-http://llm-gateway:3100/v1}"
-      }
-    }
-  }
+# Write pi gateway extension (pi extensions are JS modules, not JSON configs).
+# Routes ALL models through the LLM gateway — handles local + remote transparently.
+cat > /root/pi-gateway-extension.js <<PIEXT
+export default function(pi) {
+  pi.registerProvider("gateway", {
+    name: "LLM Gateway",
+    baseUrl: "${LLM_ENDPOINT:-http://llm-gateway:3100/v1}",
+    apiKey: "${LLM_API_KEY:-local}",
+    api: "openai-completions",
+    models: [
+      { id: "qwen25-coder-7b", name: "Qwen 2.5 Coder 7B", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32768, maxTokens: 4096, compat: { supportsDeveloperRole: false } },
+      { id: "qwen3-coder-30b-a3b", name: "Qwen 3 Coder 30B", reasoning: false, input: ["text"], cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32768, maxTokens: 4096, compat: { supportsDeveloperRole: false } },
+      { id: "deepseek-v4-pro", name: "DeepSeek V4 Pro", reasoning: true, input: ["text"], cost: { input: 2.0, output: 8.0, cacheRead: 0.5, cacheWrite: 2.0 }, contextWindow: 131072, maxTokens: 8192, compat: { supportsDeveloperRole: false } },
+      { id: "deepseek-v4-flash", name: "DeepSeek V4 Flash", reasoning: false, input: ["text"], cost: { input: 0.27, output: 1.10, cacheRead: 0.07, cacheWrite: 0.27 }, contextWindow: 1048576, maxTokens: 8192, compat: { supportsDeveloperRole: false } },
+      { id: "deepseek-reasoner", name: "DeepSeek Reasoner", reasoning: true, input: ["text"], cost: { input: 0.55, output: 2.19, cacheRead: 0.14, cacheWrite: 0.55 }, contextWindow: 131072, maxTokens: 8192, compat: { supportsDeveloperRole: false } }
+    ]
+  });
 }
-PICONFIG
+PIEXT
 
 echo "═══════════════════════════════════════════"
 echo "  pi.dev agent session ${SESSION_ID}"
@@ -49,7 +54,7 @@ echo "  Workspace: ${WORKSPACE}"
 echo ""
 echo "  pi is available in PATH."
 echo "  Run it manually:"
-echo "    pi --model ${LLM_MODEL} --api-key ${LLM_API_KEY}"
+echo "    pi --provider gateway --model ${LLM_MODEL} --api-key ${LLM_API_KEY} --extension /root/pi-gateway-extension.js"
 echo ""
 echo "═══════════════════════════════════════════"
 echo ""
