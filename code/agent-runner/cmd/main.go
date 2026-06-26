@@ -22,6 +22,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 	"time"
 
@@ -52,20 +53,24 @@ type Config struct {
 	AgentMemoryLimit string
 	DockerNetwork    string
 	FraoSkillsPath   string
+	WorkspaceHostPath string // host path of the workspace volume (for ContainerCreate Binds)
 }
 
 func loadConfig() Config {
+	dataDir := envOrDefault("DATA_DIR", "/data")
+	workspaceHost := discoverWorkspaceHostPath(dataDir)
 	return Config{
-		Port:             envOrDefault("RUNNER_PORT", defaultPort),
-		LLMGatewayURL:    envOrDefault("LLM_GATEWAY_URL", "http://llm-gateway:3100"),
-		DataDir:          envOrDefault("DATA_DIR", "/data"),
-		DefaultModel:     envOrDefault("DEFAULT_MODEL", "qwen25-coder-7b"),
-		DefaultAgent:     envOrDefault("DEFAULT_AGENT_TYPE", "picoclaw"),
-		AgentTimeout:     envInt("AGENT_TIMEOUT", 86400),
-		AgentCPULimit:    envInt("AGENT_CPU_LIMIT", 4),
-		AgentMemoryLimit: envOrDefault("AGENT_MEMORY_LIMIT", "4G"),
-		DockerNetwork:    envOrDefault("DOCKER_NETWORK", "llm-studio_llm-studio-network"),
-		FraoSkillsPath:   envOrDefault("FRAO_SKILLS_PATH", "/home/rprimera/prhyme/projects/frao-skills/skills"),
+		Port:              envOrDefault("RUNNER_PORT", defaultPort),
+		LLMGatewayURL:     envOrDefault("LLM_GATEWAY_URL", "http://llm-gateway:3100"),
+		DataDir:           dataDir,
+		DefaultModel:      envOrDefault("DEFAULT_MODEL", "qwen25-coder-7b"),
+		DefaultAgent:      envOrDefault("DEFAULT_AGENT_TYPE", "picoclaw"),
+		AgentTimeout:      envInt("AGENT_TIMEOUT", 86400),
+		AgentCPULimit:     envInt("AGENT_CPU_LIMIT", 4),
+		AgentMemoryLimit:  envOrDefault("AGENT_MEMORY_LIMIT", "4G"),
+		DockerNetwork:     envOrDefault("DOCKER_NETWORK", "llm-studio_llm-studio-network"),
+		FraoSkillsPath:    envOrDefault("FRAO_SKILLS_PATH", "/home/rprimera/prhyme/projects/frao-skills/skills"),
+		WorkspaceHostPath: workspaceHost,
 	}
 }
 
@@ -86,6 +91,31 @@ func envInt(key string, def int) int {
 	return def
 }
 
+// discoverWorkspaceHostPath reads /proc/self/mountinfo to find the host
+// path backing the workspace volume mount. ContainerCreate Binds resolve
+// on the host, so we need the host path for consistent ownership.
+func discoverWorkspaceHostPath(dataDir string) string {
+	data, err := os.ReadFile("/proc/self/mountinfo")
+	if err != nil {
+		log.Printf("WARNING: cannot read /proc/self/mountinfo: %v", err)
+		return dataDir
+	}
+	workspaceMount := dataDir + "/workspaces"
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		// Format: id parent major:minor root mountpoint ...
+		if len(fields) >= 5 && fields[4] == workspaceMount {
+			// fields[3] is the root (host path) for the mount
+			if strings.HasPrefix(fields[3], "/") {
+				log.Printf("   Workspace host path: %s", fields[3])
+				return fields[3]
+			}
+		}
+	}
+	log.Printf("WARNING: workspace mount %s not found in /proc/self/mountinfo", workspaceMount)
+	return dataDir
+}
+
 // ── Main ─────────────────────────────────────────────────────
 
 func main() {
@@ -103,15 +133,16 @@ func main() {
 
 	// Initialize Docker manager
 	dockerManager, err := docker.NewManager(docker.Config{
-		DataDir:        cfg.DataDir,
-		GatewayURL:     cfg.LLMGatewayURL,
-		DefaultModel:   cfg.DefaultModel,
-		DefaultAgent:   cfg.DefaultAgent,
-		AgentTimeout:   cfg.AgentTimeout,
-		CPULimit:       cfg.AgentCPULimit,
-		MemoryLimit:    cfg.AgentMemoryLimit,
-		DockerNetwork:  cfg.DockerNetwork,
-		FraoSkillsPath: cfg.FraoSkillsPath,
+		DataDir:           cfg.DataDir,
+		GatewayURL:        cfg.LLMGatewayURL,
+		DefaultModel:      cfg.DefaultModel,
+		DefaultAgent:      cfg.DefaultAgent,
+		AgentTimeout:      cfg.AgentTimeout,
+		CPULimit:          cfg.AgentCPULimit,
+		MemoryLimit:       cfg.AgentMemoryLimit,
+		DockerNetwork:     cfg.DockerNetwork,
+		FraoSkillsPath:    cfg.FraoSkillsPath,
+		WorkspaceHostPath: cfg.WorkspaceHostPath,
 	})
 	if err != nil {
 		log.Fatalf("Failed to initialize Docker manager: %v", err)

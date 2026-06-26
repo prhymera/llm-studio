@@ -27,15 +27,16 @@ import (
 
 // Config configures the Docker manager.
 type Config struct {
-	DataDir        string
-	GatewayURL     string
-	DefaultModel   string
-	DefaultAgent   string
-	AgentTimeout   int
-	CPULimit       int
-	MemoryLimit    string
-	DockerNetwork  string
-	FraoSkillsPath string // path on host containing frao-skills (mounted ro into agents)
+	DataDir           string
+	GatewayURL        string
+	DefaultModel      string
+	DefaultAgent      string
+	AgentTimeout      int
+	CPULimit          int
+	MemoryLimit       string
+	DockerNetwork     string
+	FraoSkillsPath    string // path on host containing frao-skills (mounted ro into agents)
+	WorkspaceHostPath string // host mountpoint of workspace volume (for ContainerCreate Binds)
 }
 
 // Manager handles Docker container lifecycle for agent sessions.
@@ -103,27 +104,49 @@ func (m *Manager) CreateSession(ctx context.Context, agentType, model, label str
 	sessID := fmt.Sprintf("sess-%d", time.Now().UnixNano())
 	userID := extractUserID(ctx)
 
-	// ── Per-user persistent home (shared across all user's sessions) ──
-	userHomeDir := filepath.Join(m.cfg.DataDir, "workspaces", userID, "home")
-	if err := os.MkdirAll(userHomeDir, 0755); err != nil {
-		return nil, fmt.Errorf("create user home: %w", err)
+	// ── Dual path resolution: agent-runner writes to its own mount, but ──
+	// ContainerCreate Binds resolve on the HOST filesystem. We need both.
+	hostRoot := m.cfg.WorkspaceHostPath // e.g. /var/lib/docker/volumes/<name>/_data
+	if hostRoot == "" {
+		hostRoot = m.cfg.DataDir // fallback (works if DataDir IS the mountpoint)
 	}
-	os.MkdirAll(filepath.Join(userHomeDir, ".npm"), 0755)
-	os.MkdirAll(filepath.Join(userHomeDir, ".npm-global"), 0755)
-	os.MkdirAll(filepath.Join(userHomeDir, ".pi", "skills"), 0755)
-	os.MkdirAll(filepath.Join(userHomeDir, ".config"), 0755)
+	agentRoot := m.cfg.DataDir // e.g. /data
+
+	// ── Per-user persistent home (shared across all user's sessions) ──
+	// agentHome writes to the volume via agent-runner's mount point.
+	// hostHome is the bind-mount source for ContainerCreate (resolved on host).
+	agentHome := filepath.Join(agentRoot, "workspaces", userID, "home")
+	hostHome := filepath.Join(hostRoot, userID, "home")
+	os.MkdirAll(agentHome, 0755)
+	os.MkdirAll(filepath.Join(agentHome, ".npm"), 0755)
+	os.MkdirAll(filepath.Join(agentHome, ".npm-global"), 0755)
+	os.MkdirAll(filepath.Join(agentHome, ".pi", "skills"), 0755)
+	os.MkdirAll(filepath.Join(agentHome, ".config"), 0755)
+	// Chown to pi-agent (1100:1100) so container user can write
+	os.Chown(agentHome, 1100, 1100)
+	filepath.Walk(agentHome, func(p string, fi os.FileInfo, err error) error {
+		if err != nil || p == agentHome {
+			return err
+		}
+		os.Chown(p, 1100, 1100)
+		return nil
+	})
 
 	// ── Soft 15GB quota per user ──
-	userRoot := filepath.Join(m.cfg.DataDir, "workspaces", userID)
+	userRoot := filepath.Join(agentRoot, "workspaces", userID)
 	if err := enforceQuota(userRoot, 15*1024*1024*1024); err != nil {
 		return nil, err
 	}
 
 	// ── Session workspace (isolated, not shared) ──
-	workspacePath := filepath.Join(m.cfg.DataDir, "workspaces", userID, "sessions", sessID)
-	if err := os.MkdirAll(workspacePath, 0755); err != nil {
+	// agentRoot is /data, hostRoot is the volume mountpoint (no "workspaces" prefix).
+	// The volume is mounted at /data/workspaces, so /data/workspaces/X → hostHost/X.
+	agentWorkspace := filepath.Join(agentRoot, "workspaces", userID, "sessions", sessID)
+	hostWorkspace := filepath.Join(hostRoot, userID, "sessions", sessID)
+	if err := os.MkdirAll(agentWorkspace, 0755); err != nil {
 		return nil, fmt.Errorf("create workspace: %w", err)
 	}
+	os.Chown(agentWorkspace, 1100, 1100)
 
 	imageName := fmt.Sprintf("llm-studio-agent-%s:latest", agentType)
 	containerName := fmt.Sprintf("agent-%s-%s", userID[:8], sessID[:12])
@@ -155,8 +178,8 @@ func (m *Manager) CreateSession(ctx context.Context, agentType, model, label str
 		},
 	}, &container.HostConfig{
 		Binds: []string{
-			fmt.Sprintf("%s:/workspace:rw", workspacePath),
-			fmt.Sprintf("%s:/home/pi-agent:rw", userHomeDir),
+			fmt.Sprintf("%s:/workspace:rw", hostWorkspace),
+			fmt.Sprintf("%s:/home/pi-agent:rw", hostHome),
 			fmt.Sprintf("%s:/frao-skills:ro", m.cfg.FraoSkillsPath),
 		},
 		Resources: container.Resources{
@@ -170,13 +193,13 @@ func (m *Manager) CreateSession(ctx context.Context, agentType, model, label str
 		NetworkMode:  container.NetworkMode(m.effectiveNetwork()),
 	}, nil, nil, containerName)
 	if err != nil {
-		os.RemoveAll(workspacePath)
+		os.RemoveAll(agentWorkspace)
 		return nil, fmt.Errorf("create container: %w", err)
 	}
 
 	if err := m.cli.ContainerStart(ctx, resp.ID, container.StartOptions{}); err != nil {
 		m.cli.ContainerRemove(ctx, resp.ID, container.RemoveOptions{Force: true})
-		os.RemoveAll(workspacePath)
+		os.RemoveAll(agentWorkspace)
 		return nil, fmt.Errorf("start container: %w", err)
 	}
 
@@ -189,7 +212,7 @@ func (m *Manager) CreateSession(ctx context.Context, agentType, model, label str
 		Model:          model,
 		Status:         "running",
 		ContainerID:    resp.ID,
-		WorkspacePath:  workspacePath,
+		WorkspacePath:  agentWorkspace,
 		WorkspaceLabel: label,
 		CreatedAt:      time.Now(),
 		LastActiveAt:   time.Now(),
