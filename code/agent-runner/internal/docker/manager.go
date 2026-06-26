@@ -18,7 +18,6 @@ import (
 	"github.com/docker/docker/api/types/container"
 	"github.com/docker/docker/api/types/filters"
 	"github.com/docker/docker/client"
-	"github.com/docker/go-connections/nat"
 	"github.com/gorilla/websocket"
 	"github.com/prhymera/llm-studio/code/agent-runner/internal/session"
 )
@@ -121,20 +120,6 @@ func (m *Manager) CreateSession(ctx context.Context, agentType, model, label str
 		"TERM=xterm-256color",
 	}
 
-	// Pre-publish pi-web.dev port for pi-type agents
-	var publishedPorts nat.PortMap
-	if agentType == "pi" {
-		piWebPort, _ := findAvailablePiWebPort()
-		if piWebPort > 0 {
-			env = append(env, fmt.Sprintf("PI_WEB_ENABLED=true"), fmt.Sprintf("PI_WEB_PORT=%d", piWebPort))
-			publishedPorts = nat.PortMap{
-				nat.Port(fmt.Sprintf("%d/tcp", piWebPort)): []nat.PortBinding{
-					{HostIP: "0.0.0.0", HostPort: fmt.Sprintf("%d", piWebPort)},
-				},
-			}
-		}
-	}
-
 	resp, err := m.cli.ContainerCreate(ctx, &container.Config{
 		Image:        imageName,
 		Env:          env,
@@ -161,7 +146,6 @@ func (m *Manager) CreateSession(ctx context.Context, agentType, model, label str
 			"/root": "rw,noexec,nosuid,size=4m",
 		},
 		NetworkMode:  container.NetworkMode(m.effectiveNetwork()),
-		PortBindings: publishedPorts,
 	}, nil, nil, containerName)
 	if err != nil {
 		os.RemoveAll(workspacePath)
