@@ -5,6 +5,7 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -323,12 +324,14 @@ func (m *Manager) AttachTerminal(w http.ResponseWriter, r *http.Request, session
 	}
 
 	var execAttach types.HijackedResponse
+	var execResp container.ExecCreateResponse
 	var lastErr error
 	attachSucceeded := false
 
 readLoop:
 	for _, cmd := range cmdsToTry {
-		execResp, execErr := m.cli.ContainerExecCreate(r.Context(), c.ID, container.ExecOptions{
+		var execErr error
+		execResp, execErr = m.cli.ContainerExecCreate(r.Context(), c.ID, container.ExecOptions{
 			Cmd:          cmd,
 			AttachStdin:  true,
 			AttachStdout: true,
@@ -420,19 +423,54 @@ readLoop:
 		}
 	}()
 
-	// WebSocket → Container stdin
+	// WebSocket → Container stdin (binary frames) or control (JSON text frames)
 	go func() {
 		for {
-			_, msg, err := ws.ReadMessage()
+			msgType, msg, err := ws.ReadMessage()
 			if err != nil {
 				errCh <- err
 				return
 			}
-			containerWriter.Write(msg)
+			switch msgType {
+			case websocket.BinaryMessage:
+				// Raw stdin bytes → PTY
+				containerWriter.Write(msg)
+			case websocket.TextMessage:
+				// JSON control frame — parse and dispatch
+				handleWSControl(r.Context(), m, execResp.ID, msg)
+			}
 		}
 	}()
 
 	<-errCh
+}
+
+// handleWSControl dispatches JSON WebSocket control frames from the frontend.
+// Supported types: resize (PTY cols/rows).
+func handleWSControl(ctx context.Context, m *Manager, execID string, msg []byte) {
+	var ctrl struct {
+		Type string `json:"type"`
+		Cols uint   `json:"cols"`
+		Rows uint   `json:"rows"`
+	}
+	if err := json.Unmarshal(msg, &ctrl); err != nil {
+		log.Printf("WS control: bad JSON: %v", err)
+		return
+	}
+	switch ctrl.Type {
+	case "resize":
+		if ctrl.Cols > 0 && ctrl.Rows > 0 {
+			err := m.cli.ContainerExecResize(ctx, execID, container.ResizeOptions{
+				Height: ctrl.Rows,
+				Width:  ctrl.Cols,
+			})
+			if err != nil {
+				log.Printf("WS resize %dx%d failed: %v", ctrl.Cols, ctrl.Rows, err)
+			}
+		}
+	default:
+		log.Printf("WS control: unknown type %q", ctrl.Type)
+	}
 }
 
 // CleanupAll stops and removes all agent containers.
